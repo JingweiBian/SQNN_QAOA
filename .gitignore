@@ -1,5 +1,7 @@
 .venv/
 outputs/
+article/
+articles/
 .matplotlib/
 
 __pycache__/

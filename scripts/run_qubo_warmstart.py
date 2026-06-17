@@ -37,8 +37,11 @@ from quantum.warmstart import (
     greedy_local_search,
     greedy_round_from_probabilities,
     make_planted_bipartite_maxcut,
+    make_noisy_planted_parity_qubo,
     make_planted_parity_qubo,
     make_random_maxcut,
+    make_random_regular_maxcut,
+    make_weighted_signed_frustration_qubo,
     qaoa_resource_summary,
     qaoa_ry_angles_from_probabilities,
     residual_qaoa_active_summary,
@@ -112,10 +115,30 @@ def make_benchmark(args):
             average_degree=args.average_degree,
             seed=args.seed,
         )
+    if args.benchmark == "random_regular_maxcut":
+        return make_random_regular_maxcut(
+            args.n,
+            average_degree=args.average_degree,
+            seed=args.seed,
+        )
     if args.benchmark == "planted_parity":
         return make_planted_parity_qubo(
             args.n,
             average_degree=args.average_degree,
+            seed=args.seed,
+        )
+    if args.benchmark == "noisy_planted_parity":
+        return make_noisy_planted_parity_qubo(
+            args.n,
+            average_degree=args.average_degree,
+            noise_rate=getattr(args, "noise_rate", 0.10),
+            seed=args.seed,
+        )
+    if args.benchmark == "weighted_signed_frustration":
+        return make_weighted_signed_frustration_qubo(
+            args.n,
+            average_degree=args.average_degree,
+            negative_ratio=getattr(args, "negative_ratio", 0.50),
             seed=args.seed,
         )
     raise ValueError(f"Unsupported benchmark: {args.benchmark}")
@@ -493,12 +516,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--benchmark",
-        choices=["planted_maxcut", "random_maxcut", "planted_parity"],
+        choices=[
+            "planted_maxcut",
+            "random_maxcut",
+            "random_regular_maxcut",
+            "planted_parity",
+            "noisy_planted_parity",
+            "weighted_signed_frustration",
+        ],
         default="planted_maxcut",
     )
     parser.add_argument("--model", choices=sorted(MODEL_REGISTRY), default="directed")
     parser.add_argument("--n", type=int, default=256)
     parser.add_argument("--average-degree", type=float, default=8.0)
+    parser.add_argument("--noise-rate", type=float, default=0.10)
+    parser.add_argument("--negative-ratio", type=float, default=0.50)
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--message-rounds", type=int, default=3)
     parser.add_argument("--hidden-dim", type=int, default=32)

@@ -3525,3 +3525,1229 @@ V12 J-regularized SQNN
 V12 的研究问题不再是“如何让每个变量每轮 J 都严格为正”，
 而是“如何在保留相干破对称能力的同时，用 J 正则减少严重局部反向更新”。
 ```
+
+### 18.10 V12 长跑探索任务
+
+用户要求：围绕 `V12 J-regularized SQNN` 系统探索模型潜力，七个方向全部尝试一遍，持续运行至少 8 小时，及时保存结果，并在探索后继续思考改进。
+
+新增脚本：
+
+```text
+scripts/explore_j_regularized_sqnn.py
+```
+
+正式输出目录：
+
+```text
+outputs/j_regularized_exploration_8h
+```
+
+探索方向：
+
+1. \(\lambda_J\) sweep；
+2. penalty 形式比较：`ReLU(-J)`、`ReLU(-J)^2`、`softplus(-J/tau)`；
+3. 轮次权重比较：flat、linear up、sqrt up、linear down、late half；
+4. `all proposals` vs `accepted proposals only`；
+5. trust-region proposal shrink，不 reset、不清空 \(Y\)；
+6. 泛化测试：`planted_parity` / `planted_maxcut`，不同 `n`、seed、average degree；
+7. residual QAOA 价值：记录 high-confidence fixing 后的 active variables、active edges、最大连通分量和 local-search / sampling 指标。
+
+记录文件：
+
+1. `summary.csv`：每个 run 的核心结果；
+2. `run_status.json`：当前进度和当前最佳配置；
+3. `final_report.json`：长跑结束后的总报告；
+4. `runs/<run_id>/metrics.json`：单个配置详细结果；
+5. `runs/<run_id>/trace_rows.csv`：逐轮指标；
+6. `summary_best_ratios.png`：当前 top runs 图。
+
+当前实验原则：
+
+```text
+保持模型干净；
+不引入 reset；
+不引入 positive-X hard projection；
+只围绕 J-regularization / round weighting / accepted-only / trust-region shrink 做探索。
+```
+
+### 18.11 V12 8 小时探索完成记录
+
+本轮长跑已经完成。执行命令：
+
+```powershell
+.venv\Scripts\python.exe scripts\explore_j_regularized_sqnn.py --device cuda --output-dir outputs\j_regularized_exploration_8h --time-budget-hours 8 --min-hours 8 --resume
+```
+
+总运行结果：
+
+| 指标 | 数值 |
+|---|---:|
+| completed runs | `137` |
+| elapsed hours | `8.0135` |
+| 输出目录 | `outputs/j_regularized_exploration_8h` |
+| 分析报告 | `outputs/j_regularized_exploration_8h/analysis_report.md` |
+
+辅助分析脚本：
+
+```text
+scripts/analyze_j_regularized_exploration.py
+```
+
+分析输出：
+
+```text
+outputs/j_regularized_exploration_8h/analysis_report.json
+outputs/j_regularized_exploration_8h/analysis_report.md
+```
+
+#### 18.11.1 当前最大潜力
+
+本轮探索里，干净 V12 模型的当前最佳结果如下：
+
+| 场景 | best expected ratio | best rounded ratio | round + local search | sample + local search | residual active | max component |
+|---|---:|---:|---:|---:|---:|---:|
+| `planted_parity`, `n=128`, `d=6`, seed `17` | `0.881953` | `0.988860` | `1.000000` | `1.000000` | `3` | `3` |
+| `planted_parity`, `n=512`, trust-region, seed `17` | `0.816512` | `0.817322` | `0.817411` | `0.822768` | `0` | `0` |
+| `planted_parity`, `n=512`, adaptive seed `736` | `0.800707` | `0.966370` | `0.988034` | `0.977631` | `48` | `7` |
+| `planted_parity`, `n=1024`, seed `17` | `0.697916` | `0.783948` | `0.830844` | `0.782444` | `232` | `163` |
+| `planted_parity`, `n=1024`, `d=6`, seed `17` | `0.656934` | `0.799416` | `0.861978` | `0.764150` | `405` | `401` |
+| `planted_maxcut`, best observed mean-field | `0.500000` | `0.000000` | case-dependent | up to about `0.68` on `n=512` | large | large |
+
+当前可以给出的潜力判断是：
+
+```text
+在 planted_parity / signed sparse QUBO 上，
+V12 已经能把 n=512 的 clean mean-field expected ratio 推到约 0.82；
+如果接 rounding / local search，多个 n=512 case 可以接近 0.99 或达到 1.0；
+n=1024 仍能明显优于随机，但 expected ratio 约停在 0.70 左右，说明扩展能力还有瓶颈；
+planted_maxcut 在当前干净 V12 下没有被真正学动，mean-field 仍卡在 0.5。
+```
+
+#### 18.11.2 七个方向逐项结论
+
+1. \(\lambda_J\) sweep：
+
+   在 `n=512, planted_parity, seed=17` 上，\(\lambda_J=100\) 的 best expected ratio 达到 `0.711434`，比无 \(J\) 正则 baseline `0.664456` 明显更好。说明 \(J\)-regularization 有真实贡献，但单纯加大 \(\lambda_J\) 不是最终答案。
+
+2. penalty 形式：
+
+   `ReLU(-J)` 仍是最稳的形式。本轮里 `relu_sq` 和 `softplus` 没有超过 `ReLU(-J)` 的最好结果。当前不建议把主线切到 squared 或 softplus penalty。
+
+3. 轮次权重：
+
+   `late_half` 在 `n=512, seed=17` 上把 best expected ratio 推到 `0.719813`，优于 flat sweep 的常规结果。直觉是：早期允许相干态自由破对称，后期再强约束方向错误，可能比全程均匀惩罚更合理。
+
+4. accepted-only：
+
+   accepted-only 变体在 \(\lambda_J=100\) 下达到 `0.714788`。它比 baseline 好，但不如 trust-region 的最好结果。说明只惩罚被全局接受的 proposal 有一定意义，但不是最强信号。
+
+5. trust-region proposal shrink：
+
+   当前最强的 `n=512` expected ratio 来自 trust-region：`trust_shrink=0.0, trust_threshold=1e-4`，best expected ratio 为 `0.816512`，并且 threshold `0.25` 下 residual active variables 为 `0`。这说明“对明显负 \(J\) 的 proposal 做小步回退/冻结”比 reset 更有前途。
+
+   但这里也有一个重要风险：这个配置的 direct rounding / local search 只有约 `0.817`，没有像某些 adaptive seed 一样接近 1.0。也就是说，它让概率分布非常自信、residual 很小，但自信方向未必全对。因此下一步必须做 threshold / calibration 检查。
+
+6. 泛化测试：
+
+   `planted_parity` 泛化明显成立：`n=128/256/512/1024` 都能跑出高于随机的结果，且 `n=512` 上已经很强。`n=1024` 的 best expected ratio 约 `0.697916`，round + local search 最高达到 `0.861978`，说明模型能扩展，但还没有把大规模问题压到很小 residual core。
+
+   `planted_maxcut` 泛化不成立：mean-field expected ratio 基本卡在 `0.5`，direct rounding 常为 `0`。这不是 GPU 或轮次问题，而更像当前全局同构初始化和同步局部规则无法打破 MaxCut 的二分对称性。
+
+7. residual QAOA / local repair 价值：
+
+   在 `planted_parity` 上，V12 的高置信 fixing 能显著缩小 residual。最强 `n=128` case 只剩 `3` 个 active variables；多个 `n=512` adaptive seed 的最大 residual component 在几十以内，round + local search 经常接近 `0.99`。这说明 V12 更适合作为 warm-start / residual reduction 前端，而不是单独作为最终求解器。
+
+#### 18.11.3 当前阶段结论
+
+本轮探索后，路线判断更新为：
+
+```text
+reset / positive-X hard projection 路线正式放弃；
+J-regularized SQNN 是当前主线；
+V12 的优势集中在 signed sparse parity-like QUBO；
+trust-region shrink 是最值得继续挖的增强；
+late-half J weighting 也值得保留；
+planted_maxcut 暂时不能声称被 V12 解决，需要单独处理破对称问题。
+```
+
+更具体地说：
+
+1. 当前 clean V12 的最大 mean-field 潜力已经看到 `0.881953`；
+2. 当前 clean V12 在 `n=512` 上的最大 mean-field 潜力是 `0.816512`；
+3. 当前 pipeline 潜力如果允许 rounding / local search，可以在若干 `planted_parity` case 上达到 `0.99-1.00`；
+4. 当前 `n=1024` 仍是瓶颈，best expected ratio 约 `0.70`；
+5. 当前 `planted_maxcut` 不是 V12 的成功案例，而是暴露 symmetry breaking 问题的诊断案例。
+
+### 18.12 V12 targeted-improve 计划
+
+8 小时全量探索之后，下一步不再盲目扩大 sweep，而是集中做 targeted improvement。新增脚本模式：
+
+```powershell
+.venv\Scripts\python.exe scripts\explore_j_regularized_sqnn.py --targeted-improve --device cuda --output-dir outputs\j_regularized_targeted_improve
+```
+
+targeted-improve 只做三类事情，仍保持模型干净：
+
+1. `targeted_trust_n512`：
+
+   围绕当前 `n=512` 最强结果，细扫 `trust_threshold` 和 \(\lambda_J\)，确认 `trust_shrink=0` 的 `0.816512` 是真实可复现增益，还是某个阈值造成的过度自信。
+
+2. `targeted_best_seed_n512`：
+
+   对已经出现高 rounding/local-search ratio 的 seeds `736/732/706`，测试 trust-region 是否能在不损伤最终 assignment 的情况下进一步提高 expected ratio 和缩小 residual。
+
+3. `targeted_scale_n1024` / `targeted_scale_trust_n1024`：
+
+   针对 `n=1024` 的瓶颈，增加 rounds/epochs，比较 \(\lambda_J=50/100\)、`flat/late_half`、以及轻量 trust-region。目标是把 `n=1024` best expected ratio 从约 `0.70` 往上推，并观察 residual max component 能否从上百降下来。
+
+下一步改进原则：
+
+```text
+先把 V12 在 planted_parity 上的上限挖透；
+优先提高 n=1024 scaling；
+谨慎使用 trust-region，避免把错误方向过早固定；
+MaxCut 暂时只作为失败诊断，不把破对称结构硬塞进 V12 主线。
+```
+
+### 18.13 V12 targeted-improve 完成记录
+
+在 8 小时全量探索之后，又继续完成了一轮 targeted-improve。执行方式为分批 resume：
+
+```powershell
+.venv\Scripts\python.exe scripts\explore_j_regularized_sqnn.py --targeted-improve --device cuda --output-dir outputs\j_regularized_targeted_improve --resume
+```
+
+输出目录：
+
+```text
+outputs/j_regularized_targeted_improve
+```
+
+本轮完成：
+
+| 指标 | 数值 |
+|---|---:|
+| completed targeted runs | `31` |
+| targeted 累计运行时间 | 约 `3.5` 小时 |
+| 分析报告 | `outputs/j_regularized_targeted_improve/analysis_report.md` |
+
+#### 18.13.1 targeted-improve 后的新上限
+
+| 场景 | 配置 | best expected ratio | rounded | round + local search | sample + local search | active | max component |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `n=512`, seed `17` | `trust_shrink=0.0`, `threshold=5e-4`, \(\lambda_J=50\) | `0.821887` | `0.819558` | `0.929502` | `0.899585` | `7` | `3` |
+| `n=512`, seed `706` | `trust_shrink=0.25`, `threshold=1e-4`, \(\lambda_J=50\) | `0.797521` | `0.827447` | `0.959963` | `0.909972` | `29` | `10` |
+| `n=512`, seed `732` | no shrink, \(\lambda_J=50\) | `0.775240` | `0.907880` | `0.992165` | `0.987135` | `84` | `59` |
+| `n=1024`, seed `17` | `trust_shrink=0.25`, `threshold=1e-4`, \(\lambda_J=50\) | `0.764526` | `0.801269` | `0.813386` | `0.815897` | `6` | `2` |
+| `n=1024`, seed `17` | no shrink, \(\lambda_J=100\), flat | `0.748968` | `0.803216` | `0.835877` | `0.824640` | `106` | `13` |
+| `n=1024`, seed `42` | no shrink, \(\lambda_J=100\), flat | `0.744658` | `0.809713` | `0.835192` | `0.828486` | `97` | `33` |
+| `n=1024`, seed `23` | no shrink, \(\lambda_J=100\), flat | `0.735232` | `0.809681` | `0.860357` | `0.826536` | `101` | `21` |
+
+因此当前更新后的潜力判断是：
+
+```text
+clean V12 在 n=512 planted_parity 上的 best expected ratio 已从 0.816512 推到 0.821887；
+clean V12 在 n=1024 planted_parity 上的 best expected ratio 已从 0.697916 推到 0.764526；
+n=1024 的 residual max component 最好已经从上百级压到 2；
+如果只看 round + local search，n=1024 seed 23 可达到 0.860357；
+n=512 的 rounding/local-search 上限仍可接近 0.99。
+```
+
+#### 18.13.2 targeted-improve 的机制判断
+
+1. `trust_threshold` 不能太严。
+
+   在 `n=512, seed=17` 上，`threshold=0` 或 `1e-5` 容易回到 `p=0.5` 停滞；`threshold=5e-4` 反而最好。这说明 trust-region 不是越硬越好，它需要允许轻微负 \(J\) 保留相干破对称路径。
+
+2. `trust_shrink` 是 residual 压缩工具，不是所有情况下的 assignment 提升工具。
+
+   对 seed `17`，trust-region 显著提高 expected ratio，并把 residual 压小；但对某些已经 rounding 很强的 seeds，no-shrink 版本的 final assignment 更好。也就是说，trust-region 更适合做 confidence fixing / residual QAOA 前端，不一定总能最大化 direct rounded solution。
+
+3. `n=1024` 上 \(\lambda_J=100\) + flat 是稳定好点。
+
+   对 seeds `17/42/23`，`j_weight=100, round_weight=flat, no shrink` 的表现都较强，best expected ratio 分别约为 `0.748968 / 0.744658 / 0.735232`。这比 8 小时探索阶段的 `0.697916` 有明显提升。
+
+4. `n=1024` 轻量 trust-region 潜力很大，但还不稳定。
+
+   seed `17` 上 `trust_shrink=0.25, threshold=1e-4` 达到 `0.764526`，并且 residual active variables 只剩 `6`、最大分量只剩 `2`；但 seed `42` 同配置只有约 `0.691830`。因此下一步要系统扫 `trust_shrink/threshold`，不能只用一个固定值。
+
+#### 18.13.3 当前最强推荐配置
+
+如果目标是提高 mean-field expected ratio 和压缩 residual：
+
+```text
+n=512:
+  j_weight = 50
+  penalty = relu
+  round_weight = flat
+  trust_shrink = 0.0
+  trust_threshold = 5e-4
+  rounds = 360
+  epochs = 160
+
+n=1024:
+  首选稳健配置:
+    j_weight = 100
+    penalty = relu
+    round_weight = flat
+    trust_shrink = 1.0
+    rounds = 420
+    epochs = 140
+
+  激进 residual 压缩配置:
+    j_weight = 50
+    penalty = relu
+    round_weight = flat
+    trust_shrink = 0.25
+    trust_threshold = 1e-4
+    rounds = 420
+    epochs = 140
+```
+
+如果目标是最终二值解质量：
+
+```text
+不要只看 expected ratio；
+需要同时看 rounded ratio、round + local search ratio、sample + local search ratio；
+某些 no-shrink 配置虽然 residual 更大，但 local search 后 assignment 更好。
+```
+
+#### 18.13.4 下一步真正值得改进的点
+
+下一阶段的改进不应该继续盲目堆轮次，而应该做以下几件事：
+
+1. **confidence calibration**：
+
+   当前 trust-region 能把 residual 压小，但有时会把错误变量也压得很自信。需要加入 fixing threshold sweep，例如 `0.20/0.25/0.30/0.35/0.40`，记录每个 threshold 下的 residual 大小和 repair 后 ratio。
+
+2. **adaptive trust-region**：
+
+   固定 `trust_shrink=0.25` 对 seed `17` 很好，对 seed `42` 不好。下一步应改成按负 \(J\) magnitude 自适应 shrink，而不是统一 shrink。
+
+3. **two-stage V12**：
+
+   第一阶段用 no-shrink / high-\(\lambda_J\) 保持相干破对称，第二阶段再启用温和 trust-region 压 residual。这样可能兼顾 assignment 质量和 residual 压缩。
+
+4. **MaxCut 单独开分支**：
+
+   MaxCut 失败不是简单调参问题，而是破二分对称问题。不要污染 V12 主线；如果要做，应明确作为 `V13 symmetry-breaking SQNN`，例如引入可控的微弱节点级初始扰动或结构特征，而不是继续在 V12 里硬扫。
+
+### 18.14 现实意义路线更新：noisy / weighted signed / MaxCut
+
+用户明确要求：后续模型必须有现实意义，尤其要面向大规模、有真实组合优化价值的问题，并且最终要服务于 QAOA warm-start。因此路线更新为：
+
+```text
+V12 主线：
+  noisy planted parity
+  -> weighted signed graph frustration
+  -> large sparse signed QUBO residual compression
+
+V13 分支：
+  symmetry-breaking MaxCut
+  -> negative-edge-ratio bridge
+  -> MaxCut / QAOA warm-start
+```
+
+这意味着：
+
+1. clean planted parity 只保留为诊断 benchmark，不再作为最终现实应用；
+2. noisy planted parity 用来测试干净结构被破坏后，模型是否还能保留 warm-start / residual compression 能力；
+3. weighted signed graph frustration 作为 V12 最重要的现实问题族；
+4. MaxCut 必须做，但不能继续用 clean V12，而要单独作为 V13 symmetry-breaking 分支；
+5. 用 `negative_ratio` 从 mixed signed graph 逐渐推到 `1.0`，把 signed frustration 和 MaxCut 接起来。
+
+新增 benchmark：
+
+```text
+noisy_planted_parity
+weighted_signed_frustration
+```
+
+对应代码：
+
+```text
+quantum/warmstart/benchmarks.py
+scripts/run_qubo_warmstart.py
+scripts/explore_j_regularized_sqnn.py
+```
+
+其中：
+
+```text
+noisy_planted_parity:
+  先生成 hidden assignment；
+  再翻转一部分 same/different 边；
+  用于测试抗噪声和 hidden-structure recovery。
+
+weighted_signed_frustration:
+  正边希望变量相同；
+  负边希望变量不同；
+  边权表示约束重要性；
+  目标是最大化 satisfied signed-edge weight。
+
+negative_ratio = 1.0:
+  所有边都希望不同；
+  这就是 signed-edge 形式下的 MaxCut。
+```
+
+新增探索模式：
+
+```powershell
+.venv\Scripts\python.exe scripts\explore_j_regularized_sqnn.py --realistic-roadmap --device cuda --output-dir outputs\realistic_roadmap_probe
+```
+
+这个队列同时覆盖：
+
+1. noisy planted parity；
+2. weighted signed frustration；
+3. `negative_ratio = 0.5 / 0.7 / 0.9 / 1.0`；
+4. V13 random-Z symmetry breaking；
+5. adaptive trust-region；
+6. two-stage V12；
+7. n=512 / n=1024 规模验证。
+
+### 18.15 realistic-roadmap 初步结果
+
+本轮 probe 输出目录：
+
+```text
+outputs/realistic_roadmap_probe
+```
+
+完成配置数：
+
+```text
+34 runs
+```
+
+#### 18.15.1 关键结果表
+
+| 问题族 | n | 关键配置 | best expected ratio | round + local search | sample + local search | residual active | max component |
+|---|---:|---|---:|---:|---:|---:|---:|
+| `planted_maxcut` | 256 | V13 random-Z, strength `0.20` | `0.813585` | `0.990192` | `0.985605` | `5` | `3` |
+| `planted_maxcut` | 512 | V13 random-Z, strength `0.20` | `0.756406` | `0.823371` | `0.834898` | `22` | `10` |
+| `planted_maxcut` | 1024 | V13 random-Z, strength `0.20` | `0.770585` | `0.827755` | `0.824174` | `6` | `2` |
+| `noisy_planted_parity`, noise `0.10` | 512 | two-stage V12, \(\lambda_J=100\) | `0.756189` | `0.819790` | `0.837264` | `23` | `6` |
+| `noisy_planted_parity`, noise `0.10` | 1024 | two-stage V12, \(\lambda_J=100\) | `0.773820` | `0.812181` | `0.809950` | `8` | `2` |
+| `weighted_signed_frustration`, neg `0.70` | 512 | V13 random-Z, strength `0.12` | `0.782672` | `0.819891` | `0.835408` | `8` | `2` |
+| `weighted_signed_frustration`, neg `0.70` | 1024 | V13 random-Z, strength `0.12` | `0.778213` | `0.821614` | `0.822274` | `20` | `4` |
+| `weighted_signed_frustration`, neg `1.00` | 512 | V13 random-Z, strength `0.12` | `0.765121` | `0.818686` | `0.828424` | `15` | `5` |
+| `weighted_signed_frustration`, neg `1.00` | 1024 | V13 random-Z, strength `0.12` | `0.750179` | `0.818413` | `0.807290` | `37` | `6` |
+
+这里的 ratio 对 `weighted_signed_frustration` 和 `noisy_planted_parity` 是：
+
+```text
+satisfied signed-edge weight / total signed-edge weight
+```
+
+也就是相对于总边权的满足比例上界，不等同于 frustration optimum 的 approximation ratio。后续如果要和 Aref / Gurobi 精确结果比较，需要把 exact optimum 或 best-known optimum 接入 denominator。
+
+#### 18.15.2 目前最重要的判断
+
+1. **V13 破对称对 MaxCut 是必要的。**
+
+   clean V12 在 MaxCut 上会卡在约 `0.5`。加入 random-Z symmetry breaking + two-stage trust-region 后，`n=256 planted_maxcut` 已经能到：
+
+   ```text
+   best expected ratio = 0.813585
+   round + local search = 0.990192
+   residual active = 5
+   max component = 3
+   ```
+
+   `n=1024 planted_maxcut` 也能到：
+
+   ```text
+   best expected ratio = 0.770585
+   round + local search = 0.827755
+   residual active = 6
+   max component = 2
+   ```
+
+2. **weighted signed frustration 大规模下必须用 V13 symmetry breaking。**
+
+   对 `n=512/1024, negative_ratio=0.70`，只用 adaptive trust、不做 symmetry breaking 会回到：
+
+   ```text
+   expected ratio ≈ 0.5
+   residual active ≈ n
+   ```
+
+   加入 V13 random-Z 后，`n=1024, negative_ratio=0.70` 变成：
+
+   ```text
+   best expected ratio = 0.778213
+   round + local search = 0.821614
+   residual active = 20
+   max component = 4
+   ```
+
+3. **noisy planted parity 是有效桥梁。**
+
+   `noise_rate=0.10` 时，`n=1024` 的 two-stage V12 结果为：
+
+   ```text
+   best expected ratio = 0.773820
+   round + local search = 0.812181
+   residual active = 8
+   max component = 2
+   ```
+
+   说明从 clean planted parity 走向 noisy constraints 后，模型仍能保留 residual compression 能力。
+
+4. **confidence calibration 已经接入，但还需要强化。**
+
+   目前脚本已经对多个 fixing threshold 做 exact residual completion；当 residual 足够小时，会输出：
+
+   ```text
+   best_calibrated_exact_ratio
+   best_calibrated_exact_threshold
+   best_calibrated_exact_remaining_variables
+   ```
+
+   但很多大规模 case residual 仍超过当前 exact 枚举阈值，因此 exact completion 还不是所有 run 都能给出结果。后续要加入 component-wise exact completion，而不是只看总 remaining variable count。
+
+#### 18.15.3 研究路线的阶段性结论
+
+当前更准确的模型定位是：
+
+```text
+V12:
+  能在 noisy planted parity 上保留大规模 residual compression；
+  适合作为 signed sparse QUBO warm-start 前端。
+
+V13:
+  在 V12 基础上加入 symmetry breaking；
+  是 MaxCut 和高负边比例 signed frustration 的必要分支。
+
+主现实问题:
+  weighted signed graph frustration。
+
+量子 QAOA 目标:
+  用 SQNN 把 n=512/1024 甚至更大图压成小 residual core；
+  再对 residual core 做 component-wise exact / QAOA。
+```
+
+下一步优先级：
+
+1. component-wise exact completion / component-wise residual QAOA；
+2. V13 symmetry strength sweep for `n=512/1024 MaxCut`；
+3. weighted signed frustration 多 seed、多 negative ratio、大规模 sweep；
+4. 接入真实 signed-network 数据集或生成 Aref-style benchmark，并用 Gurobi / ILP / local-search baseline 对照；
+5. 把 ratio denominator 从 total edge weight 升级为 exact/best-known frustration optimum。
+
+### 18.16 V12/V13 潜力探索：现实任务两小时批处理
+
+本轮探索目标不是继续在 clean planted parity 上刷分，而是检验模型在更有现实意义的稀疏组合优化任务上的潜力：
+
+```text
+输出目录:
+  outputs/j_regularized_potential_probe_2h
+
+完成 run 数:
+  36
+
+自动报告:
+  outputs/j_regularized_potential_probe_2h/potential_probe_report.md
+
+图表目录:
+  outputs/j_regularized_potential_probe_2h/plots
+```
+
+本轮新增了 `random_regular_maxcut` benchmark。`average_degree=3` 时对应 MaxCut-3，也就是 3-正则无权图 MaxCut。需要注意：本轮 `noisy_planted_parity`、`weighted_signed_frustration`、`random_regular_maxcut` 的 ratio 仍然是
+
+```text
+satisfied signed-edge weight / total signed-edge weight
+或
+cut weight / total edge weight
+```
+
+因此它是总边权归一化质量，不是相对于 exact optimum 的严格 approximation ratio。后续如果写论文或和 Gurobi/ILP/Aref-style exact baseline 对比，必须把 denominator 升级成 exact/best-known optimum。
+
+后处理算法也已经明确命名：
+
+```text
+round + 1-bit greedy QUBO descent
+```
+
+含义是：先用 `p_i >= 0.5` 得到二值解；然后每一轮计算所有变量单独翻转的 QUBO 能量增量 \(\Delta E_i\)，选择最负的 \(\Delta E_i\) 翻转；如果所有 \(\Delta E_i >= 0\)，或者达到 pass 上限，就停止。这个不是泛泛的 local search，而是单比特贪心下降。
+
+#### 18.16.1 本轮覆盖的任务强度
+
+```text
+V12 noisy planted parity:
+  n = 512 / 1024
+  noise_rate = 0.00 / 0.05 / 0.10
+  plain V12 vs two-stage V12
+
+weighted signed graph frustration:
+  n = 512 / 1024
+  negative_ratio = 0.30 / 0.50
+  V12 adaptive trust-region vs V13 random-Z symmetry breaking
+
+MaxCut-3:
+  random 3-regular unweighted graph
+  n = 512 / 1024
+  V13 random-Z symmetry strength = 0.05 / 0.10 / 0.20 / 0.30
+  seed = 17，并补充 seed = 23 的部分点
+```
+
+#### 18.16.2 当前最强结果
+
+| 任务 | n | 配置 | best expected | round + 1-bit greedy | sample + 1-bit greedy | residual active | max component |
+|---|---:|---|---:|---:|---:|---:|---:|
+| MaxCut-3 | 1024 | V13 random-Z, strength `0.20`, seed `17` | `0.835682` | `0.871745` | `0.875651` | `6` | `4` |
+| MaxCut-3 | 512 | V13 random-Z, strength `0.05`, seed `23` | `0.806886` | `0.876302` | `0.889323` | `25` | `4` |
+| MaxCut-3 | 512 | V13 random-Z, strength `0.30`, seed `17` | `0.829179` | `0.875000` | `0.878906` | `10` | `2` |
+| weighted signed frustration, neg `0.30` | 1024 | V12 adaptive trust-region | `0.799594` | `0.827751` | `0.833822` | `13` | `6` |
+| weighted signed frustration, neg `0.30` | 1024 | V13 random-Z, strength `0.08` | `0.798465` | `0.833500` | `0.836414` | `12` | `2` |
+| weighted signed frustration, neg `0.50` | 1024 | V12 adaptive trust-region | `0.784234` | `0.817966` | `0.820122` | `20` | `3` |
+| noisy planted parity, noise `0.10` | 512 | V12 two-stage | `0.755272` | `0.833267` | `0.842291` | `13` | `3` |
+| noisy planted parity, noise `0.10` | 1024 | V12 two-stage | `0.745458` | `0.804760` | `0.805727` | `16` | `2` |
+
+#### 18.16.3 关键判断
+
+1. **V13 MaxCut-3 是目前最有希望的 QAOA warm-start 分支。**
+
+   这是本轮最重要的新结果。以前 MaxCut 还只是 `planted_maxcut` 或 signed bridge 的延伸；现在 `random_regular_maxcut, d=3` 直接对应 MaxCut-3。`n=1024` 上 best expected ratio 已经到 `0.835682`，后处理后到 `0.875651`，而 residual active 只有 `6`、最大分量只有 `4`。这说明 V13 不只是破 symmetry，它确实能把随机 3-正则 MaxCut 压成很小的 residual core。
+
+2. **symmetry strength 不是越大越好。**
+
+   `n=1024, seed=17` 的 MaxCut-3：
+
+   ```text
+   strength 0.05: expected 0.812494, sample+greedy 0.868490, active 33
+   strength 0.10: expected 0.816974, sample+greedy 0.869792, active 42
+   strength 0.20: expected 0.835682, sample+greedy 0.875651, active 6
+   strength 0.30: expected 0.831641, sample+greedy 0.862630, active 0
+   ```
+
+   `0.30` 会把 residual 压到 `0`，但质量下降；这说明过强 symmetry breaking 可能过早锁死次优二值解。当前最值得继续扫的是 `0.15 / 0.18 / 0.20 / 0.22 / 0.25`。
+
+3. **V12 two-stage 是 residual-compression 工具，不一定是最佳二值解工具。**
+
+   在 noisy parity 上，two-stage 会显著压 residual。例如 `n=1024, noise=0.10`：
+
+   ```text
+   V12 plain:
+     expected 0.684712
+     round+greedy 0.816295
+     residual active 219
+     max component 140
+
+   V12 two-stage:
+     expected 0.745458
+     round+greedy 0.804760
+     residual active 16
+     max component 2
+   ```
+
+   这说明 two-stage 更适合接 residual QAOA / exact completion；如果目标是直接二值解质量，有时 plain + greedy 反而更高。
+
+4. **weighted signed frustration 在 neg=0.30/0.50 下仍然可做，但需要更强 baseline。**
+
+   `n=1024, neg=0.30` 下，V12 adaptive 和 V13 random-Z 都接近：
+
+   ```text
+   V12 adaptive:
+     expected 0.799594
+     sample+greedy 0.833822
+     residual active 13
+     max component 6
+
+   V13 random-Z strength 0.08:
+     expected 0.798465
+     sample+greedy 0.836414
+     residual active 12
+     max component 2
+   ```
+
+   但 `n=512, neg=0.50` 的 V12 adaptive 出现 mean-field 停在 `0.5`、residual 几乎全活跃的失败点，说明 signed frustration 比 MaxCut-3 更依赖任务结构和 symmetry/calibration。后续需要多 seed 和 exact/best-known denominator 才能判断真实竞争力。
+
+#### 18.16.4 下一步改进方向
+
+1. **V13 MaxCut-3 细扫。**
+   固定 `n=1024, d=3`，重点扫 `symmetry_strength = 0.15 / 0.18 / 0.20 / 0.22 / 0.25`，并加入 seeds `17/23/42/101/202`。目标不是只追 expected，而是同时看 `sample+greedy`、residual active、max component。
+
+2. **把 residual QAOA 真正接上。**
+   当前 `max component <= 4` 的 MaxCut-3 run 已经非常适合做 component-wise exact / small-QAOA。下一步应该把图 3 从 “接单比特贪心” 升级为 “接 component-wise exact / local QAOA”，这样才更贴近最终量子 QAOA 目标。
+
+3. **weighted signed frustration 要引入 exact/best-known baseline。**
+   目前 denominator 是 total edge weight。下一步需要至少加入小中规模 exact/ILP 或强 classical heuristic 作为 best-known denominator，否则无法严肃声称 approximation ratio。
+
+4. **noisy parity 保留为诊断桥，而不是最终主应用。**
+   它能很好地区分 plain/two-stage 的 residual compression 机制，但现实意义不如 MaxCut-3 和 weighted signed frustration。后续只保留 noise sweep 作为结构破坏诊断。
+
+### 18.17 MaxCut-3 升级：可学习 symmetry strength
+
+用户提出：既然 V13 random-Z symmetry strength 对 MaxCut-3 很关键，是否可以把 strength 直接作为优化变量，而不是手工扫参。
+
+结论：
+
+```text
+可以。
+```
+
+实现方式已经接入 `scripts/explore_j_regularized_sqnn.py`：
+
+```text
+--maxcut3-strength-learn
+```
+
+核心参数化为：
+
+```text
+strength = strength_max * sigmoid(raw_strength)
+```
+
+其中 `raw_strength` 是可训练参数，和 `field_steps / phase_steps / mixer_bias / initial_angles` 一起由 AdamW 更新。这样做的原因是：
+
+1. strength 必须非负；
+2. strength 不应该无界增大，否则容易过早锁死二值解；
+3. 用 sigmoid 上界以后，仍然保留梯度可训练性。
+
+新增记录字段：
+
+```text
+symmetry_strength_trainable
+symmetry_strength_max
+final_symmetry_strength
+```
+
+#### 18.17.1 初步 smoke / paired 结果
+
+输出目录：
+
+```text
+outputs/maxcut3_learn_strength_probe
+outputs/maxcut3_strength_fixed_pair
+```
+
+任务：
+
+```text
+random_regular_maxcut
+n = 512
+d = 3
+seed = 17
+V13 random-Z
+two-stage trust-region
+j_weight = 100
+rounds = 240
+epochs = 90
+```
+
+可学习 strength 初步结果：
+
+| init strength | max strength | final strength | best expected | round + 1-bit greedy | sample + 1-bit greedy | residual active | max component |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| `0.05` | `0.30` | `0.042632` | `0.743857` | `0.871094` | `0.876302` | `115` | `17` |
+| `0.05` | `0.50` | `0.043806` | `0.500117` | `0.796875` | `0.742188` | `512` | `512` |
+| `0.10` | `0.30` | `0.088885` | `0.803732` | `0.854167` | `0.863281` | `31` | `3` |
+| `0.10` | `0.50` | `0.086923` | `0.799139` | `0.854167` | `0.865885` | `43` | `7` |
+
+配对固定 strength 对照：
+
+```text
+same graph seed = 17
+same random-Z seed = 7759
+fixed strength = 0.10
+```
+
+结果：
+
+| method | strength | best expected | round + 1-bit greedy | sample + 1-bit greedy | residual active | max component |
+|---|---:|---:|---:|---:|---:|---:|
+| fixed | `0.100000` | `0.547991` | `0.854167` | `0.777344` | `332` | `280` |
+| learnable | `0.100000 -> 0.088885` | `0.803732` | `0.854167` | `0.863281` | `31` | `3` |
+
+这个配对实验说明：learnable strength 不只是形式上可训练；在某些 random-Z seed / initial strength 组合下，它能明显修正坏扰动，把 residual 从大核心压到小核心。
+
+#### 18.17.2 当前判断
+
+1. **strength 可以直接作为优化变量。**
+
+   因为 random-Z 向量固定后，初始角度为：
+
+   ```text
+   theta_i = theta_base + strength * random_noise_i
+   ```
+
+   这对 strength 是可微的，后续 Bloch rotation、expected energy、J penalty 都能把梯度传回 strength。
+
+2. **但 naive joint optimization 不一定自动超过手工 sweep 的全局最优。**
+
+   当前可学习 run 里，strength 往往会变小。例如 `0.10 -> 0.088885`。这对修正坏 seed 有帮助，但它优化的是：
+
+   ```text
+   normalized expected energy
+   + J penalty
+   - entropy term
+   ```
+
+   它不是直接优化最终 `sample + 1-bit greedy`，也不是直接优化 residual QAOA 后的结果。因此它可能为了减少 J 负值或保持训练稳定而降低 symmetry strength。
+
+3. **最合理路线不是完全取消 sweep，而是做混合策略。**
+
+   下一步推荐：
+
+   ```text
+   outer loop:
+     扫少量 init_strength / strength_max / random-Z seed
+
+   inner loop:
+     让 strength 可学习
+   ```
+
+   也就是把原来的固定 strength sweep 升级成 learnable-strength multi-start，而不是只保留单个 trainable strength。
+
+#### 18.17.3 下一步 MaxCut-3 升级计划
+
+1. 固定 `n=1024, d=3`，跑：
+
+   ```text
+   init_strength = 0.10 / 0.15 / 0.20
+   strength_max = 0.30 / 0.50
+   seed = 17 / 23 / 42 / 101 / 202
+   ```
+
+2. 同时记录：
+
+   ```text
+   final_symmetry_strength
+   best_expected_ratio
+   sample + 1-bit greedy
+   residual active
+   max component
+   component-wise exact / QAOA result
+   ```
+
+3. 如果 learnable strength 经常向某个区间收敛，例如 `0.08-0.12` 或 `0.18-0.22`，就把这个区间作为 V13 MaxCut-3 的默认初始化区间。
+
+### 18.18 MaxCut-3 residual p=2 QAOA 初步接入结果
+
+用户要求：针对当前 MaxCut-3 表现最好的两组，一个 `n=512`，一个 `n=1024`，在 round 固定变量之后接两层 QAOA，查看最终效果。
+
+本轮计算采用：
+
+```text
+固定变量集合:
+  |p_i - 0.5| >= threshold
+
+固定变量取值:
+  p_i >= 0.5 -> x_i = 1
+  p_i <  0.5 -> x_i = 0
+
+QAOA:
+  component-wise p=2 QAOA
+  每个 residual 连通分量独立优化一套 gamma/beta
+  steps = 160
+  restarts = 4
+```
+
+输出目录：
+
+```text
+outputs/maxcut3_residual_p2_qaoa
+```
+
+对应脚本：
+
+```text
+scripts/run_maxcut3_residual_qaoa_from_exploration.py
+```
+
+#### 18.18.1 n=1024 最强 expected run
+
+来源 run：
+
+```text
+potential_v13_maxcut3_symmetry_random_regular_maxcut_n1024_d3p0_s17_jw100p0_relu_fc674c86e2
+```
+
+原始结果：
+
+```text
+rounded ratio          = 0.861328
+round + 1-bit greedy   = 0.871745
+```
+
+p=2 QAOA threshold sweep：
+
+| threshold | remaining | isolated | active | max comp | p2 QAOA expected | exact residual |
+|---:|---:|---:|---:|---:|---:|---:|
+| `0.25` | `15` | `9` | `6` | `4` | `0.864790` | `0.865234` |
+| `0.30` | `23` | `15` | `8` | `4` | `0.865281` | `0.865885` |
+| `0.35` | `31` | `23` | `8` | `4` | `0.866583` | `0.867188` |
+| `0.40` | `43` | `27` | `16` | `4` | `0.866863` | `0.867839` |
+
+这里 p2 QAOA 的最好 expected ratio 是：
+
+```text
+0.866863
+```
+
+但它仍然低于：
+
+```text
+round + 1-bit greedy = 0.871745
+```
+
+更关键的是，即使 exact residual completion 的上限也只有：
+
+```text
+0.867839
+```
+
+这说明不是 p=2 QAOA 优化不充分，而是 `round fixing` 本身已经把部分后续应该翻转的变量锁死了。QAOA 只能在固定后的子空间里优化，无法超过这个子空间的 exact 上限。
+
+#### 18.18.2 n=512 最强 binary run
+
+来源 run：
+
+```text
+potential_v13_maxcut3_symmetry_random_regular_maxcut_n512_d3p0_s23_jw100p0_relu_762baf65d2
+```
+
+原始结果：
+
+```text
+rounded ratio          = 0.845052
+round + 1-bit greedy   = 0.876302
+sample + 1-bit greedy  = 0.889323
+```
+
+p=2 QAOA threshold sweep：
+
+| threshold | remaining | isolated | active | max comp | p2 QAOA expected | exact residual |
+|---:|---:|---:|---:|---:|---:|---:|
+| `0.25` | `44` | `19` | `25` | `4` | `0.859358` | `0.860677` |
+| `0.30` | `56` | `24` | `32` | `4` | `0.860038` | `0.863281` |
+| `0.35` | `74` | `24` | `50` | `7` | `0.860480` | `0.868490` |
+| `0.40` | `97` | `27` | `70` | `19` | `0.860808` | `0.875000` |
+
+这里 p2 QAOA 的最好 expected ratio 是：
+
+```text
+0.860808
+```
+
+exact residual 上限最高为：
+
+```text
+0.875000
+```
+
+仍然略低于：
+
+```text
+round + 1-bit greedy = 0.876302
+```
+
+并明显低于：
+
+```text
+sample + 1-bit greedy = 0.889323
+```
+
+#### 18.18.3 关键判断
+
+1. **当前 round fixing + p=2 QAOA 没有超过 1-bit greedy。**
+
+   对这两组最强 MaxCut-3 结果，p=2 residual QAOA 的 expected ratio 都低于 `round + 1-bit greedy`。
+
+2. **问题主要出在 fixing，而不是 residual QAOA 本身。**
+
+   `n=1024` 上 exact residual 上限都低于 `round + 1-bit greedy`，这说明固定变量已经锁死了一部分有用翻转。后续 QAOA 再强，也只能在错误固定后的子空间里优化。
+
+3. **QAOA 接法要改。**
+
+   下一步不应该简单地：
+
+   ```text
+   high confidence round fixing -> residual QAOA
+   ```
+
+   而应该测试：
+
+   ```text
+   更保守 fixing threshold，例如 0.45 / 0.48 / 0.49；
+   或只固定 greedy 后仍稳定的变量；
+   或让 QAOA 接在 residual + selected uncertain shell 上，而不是把所有高置信变量永久锁死。
+   ```
+
+4. **这反而是有价值的负结果。**
+
+   它说明 V13 SQNN 当前最强作用是提供很好的二值初始解和 residual 结构诊断；如果要把 QAOA 作为增益模块，必须避免把 QAOA 的可优化空间切得太窄。
+
+### 18.19 当前路线冻结：聚焦 MaxCut / MaxCut-3
+
+用户明确要求：当前阶段先聚焦 MaxCut 问题。`noisy planted parity` 和 `weighted signed graph frustration` 不是放弃，而是先封存，作为后续对照和扩展路线。
+
+#### 18.19.1 主线任务
+
+当前主线改为：
+
+```text
+MaxCut
+  -> random regular MaxCut-3
+  -> large sparse MaxCut warm-start
+  -> residual QAOA / local QAOA
+```
+
+其中 `MaxCut-3` 指：
+
+```text
+random_regular_maxcut
+average_degree = 3
+unweighted 3-regular graph
+objective = cut weight / total edge weight
+```
+
+当前最值得主打的结果是：
+
+```text
+n = 1024
+d = 3
+model = V13 random-Z symmetry-breaking J-regularized SQNN
+symmetry_strength = 0.20
+
+best expected ratio        = 0.835682
+round + 1-bit greedy       = 0.871745
+sample + 1-bit greedy      = 0.875651
+residual active variables  = 6
+max component              = 4
+```
+
+另一个二值后处理质量最高的结果是：
+
+```text
+n = 512
+d = 3
+seed = 23
+model = V13 random-Z symmetry-breaking J-regularized SQNN
+symmetry_strength = 0.05
+
+round + 1-bit greedy       = 0.876302
+sample + 1-bit greedy      = 0.889323
+residual active variables  = 25
+max component              = 4
+```
+
+#### 18.19.2 当前主模型
+
+当前主模型命名为：
+
+```text
+V13 random-Z symmetry-breaking J-regularized SQNN for MaxCut-3
+```
+
+它由以下部分组成：
+
+1. **SQNN message-round dynamics**
+
+   每个变量是一个 Bloch 向量，经过多轮 local-field 驱动的旋转更新。
+
+2. **J-regularized direction constraint**
+
+   每一轮对每个变量计算：
+
+   ```text
+   J_i^t = - local_field_i^t * (p_i^{t+1} - p_i^t)
+   ```
+
+   用 `ReLU(-J_i^t)` 惩罚负方向，鼓励每轮局部更新方向不要系统性地走反。
+
+3. **two-stage trust-region**
+
+   前半段允许破对称和形成结构；后半段当 `J` 负得超过 threshold 时缩小该变量的 proposal step，避免方向错误扩大。
+
+4. **random-Z symmetry breaking**
+
+   对每个变量加一个固定随机 Z 方向扰动：
+
+   ```text
+   theta_i = theta_base + strength * random_noise_i
+   ```
+
+   这是 MaxCut-3 必须保留的机制。没有 symmetry breaking 时，MaxCut 容易卡在对称的 `p=0.5` 附近。
+
+5. **后处理**
+
+   当前使用：
+
+   ```text
+   round:
+     p_i >= 0.5 -> x_i = 1
+     p_i <  0.5 -> x_i = 0
+
+   1-bit greedy QUBO descent:
+     每轮计算所有单比特翻转的能量增量；
+     翻转能量下降最多的变量；
+     直到没有单比特翻转能继续降低能量。
+   ```
+
+6. **residual QAOA**
+
+   当前已经接入 component-wise `p=2` QAOA，但初步结果显示：如果先做过激 round fixing，QAOA 会被限制在错误固定后的子空间里，无法超过 `round + 1-bit greedy`。因此 QAOA 接法要改成更保守 fixing 或 selected uncertain shell。
+
+#### 18.19.3 当前要优化的变量
+
+当前 MaxCut-3 主线要优化的变量分成三层。
+
+**A. SQNN 内部可训练参数**
+
+```text
+field_steps[t]
+  每一轮 local field 对 mixer rotation 的步长。
+
+phase_steps[t]
+  每一轮 local field 对 phase rotation 的步长。
+
+mixer_bias[t]
+  每一轮的全局 mixer 偏置。
+
+initial_angles[3]
+  全体变量共享的初始 Bloch 角度。
+```
+
+**B. MaxCut symmetry-breaking 参数**
+
+```text
+symmetry_strength
+  random-Z 破对称强度。
+  当前固定扫描中最优区域约在 0.15-0.25，
+  n=1024 seed=17 的最好点是 0.20。
+
+raw_symmetry_strength
+  可学习版本中实际训练的 unconstrained 参数。
+
+symmetry_strength_max
+  可学习 strength 的上界。
+
+symmetry_seed
+  random-Z 扰动向量的 seed。
+  这不是模型权重，但会显著影响破对称路径，需要 multi-start。
+```
+
+当前判断：
+
+```text
+固定扫描 strength 更适合找上限；
+learnable strength 更适合修正坏配置；
+最合理方案是 outer-loop multi-start + inner-loop learnable strength。
+```
+
+**C. QAOA / residual 接口变量**
+
+```text
+fixing threshold
+  当前不能只用 0.25/0.30/0.35/0.40。
+  下一步要扫 0.45 / 0.48 / 0.49，
+  避免过早锁死后续 QAOA 需要翻转的变量。
+
+QAOA layers
+  当前已测 p=2。
+  后续要测 p=1/2/3，并比较 expected value 和采样后的二值解。
+
+QAOA initialization
+  plus initialization: residual qubit 从 p=0.5 开始；
+  SQNN initialization: residual qubit 从 SQNN 概率开始；
+  后续还要测试 greedy-shell initialization。
+
+component grouping
+  当前使用 component-wise independent QAOA parameters。
+  这是 MaxCut-3 residual core 很小、连通块分散时的合理执行方式。
+```
+
+#### 18.19.4 暂时封存的路线
+
+以下路线暂时不作为当前主线推进，但保留代码和结果，后续可恢复：
+
+```text
+noisy planted parity
+```
+
+用途：
+
+```text
+作为结构破坏诊断 benchmark；
+检验 V12 two-stage 是否还能做 residual compression；
+不作为当前论文主应用。
+```
+
+```text
+weighted signed graph frustration
+```
+
+用途：
+
+```text
+作为现实 signed-network / frustration-index 扩展方向；
+需要 exact/best-known denominator 后才能严肃报告 approximation ratio；
+当前先封存，不继续抢占 MaxCut 主线预算。
+```
+
+封存不是放弃。当前策略是：
+
+```text
+先把 MaxCut-3 主线做深、做强、做清楚；
+等 MaxCut/QAOA warm-start 机制稳定后，
+再回到 weighted signed frustration 做现实 signed network 扩展。
+```
+
+#### 18.19.5 下一轮实验优先级
+
+1. **MaxCut-3 strength fine sweep**
+
+   ```text
+   n = 1024
+   d = 3
+   strength = 0.15 / 0.18 / 0.20 / 0.22 / 0.25
+   seed = 17 / 23 / 42 / 101 / 202
+   ```
+
+2. **learnable strength multi-start**
+
+   ```text
+   init_strength = 0.10 / 0.15 / 0.20 / 0.25
+   strength_max = 0.30 / 0.50
+   random-Z seed 多起点
+   ```
+
+3. **更保守 residual QAOA fixing**
+
+   ```text
+   threshold = 0.45 / 0.48 / 0.49
+   compare:
+     rounded
+     round + 1-bit greedy
+     p=2/p=3 component-wise QAOA
+     exact residual completion
+   ```
+
+4. **QAOA 接法改造**
+
+   当前负结果说明：
+
+   ```text
+   high-confidence round fixing -> residual QAOA
+   ```
+
+   可能太窄。下一步要试：
+
+   ```text
+   greedy-stable fixing
+   selected uncertain shell QAOA
+   residual + boundary variables QAOA
+   ```
+
+5. **报告口径**
+
+   当前 MaxCut-3 ratio 是：
+
+   ```text
+   cut weight / total edge weight
+   ```
+
+   后续如果要写成严格 approximation ratio，需要接入 exact/best-known MaxCut denominator。

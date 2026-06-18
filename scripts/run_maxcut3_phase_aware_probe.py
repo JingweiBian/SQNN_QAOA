@@ -480,6 +480,9 @@ def build_variants(base, rounds, epochs):
 
 
 def maxcut_vector_ratio(benchmark, bloch, best_known):
+    # Diagnostic only: this scores full Bloch-vector anti-alignment
+    # sum w_ij (1 - r_i dot r_j)/2. It is not the measurement-faithful MaxCut
+    # objective, whose physical cost is Z-basis C = sum w_ij(1-Z_i Z_j)/2.
     if benchmark.edge_index.numel() == 0:
         return bloch.new_tensor(0.0)
     src, dst = benchmark.edge_index
@@ -572,6 +575,9 @@ def train_phase_one(config, device, output_dir):
         state = model(problem, return_state=True)
         probabilities = state["probabilities"]
         energy = problem.expected_energy(probabilities)
+        # Main training objective remains Z-basis/product-distribution MaxCut:
+        # E_QUBO(p) = -C(p). RZ/XY phase terms are only hidden dynamics unless
+        # vector_loss_weight is explicitly set for an auxiliary experiment.
         normalized_energy = energy / (problem.num_variables * problem.coefficient_scale())
         progress = epoch / max(int(config["epochs"]) - 1, 1)
         entropy_weight = float(config["entropy_weight"]) * (1.0 - progress) + float(
@@ -581,6 +587,9 @@ def train_phase_one(config, device, output_dir):
         j_penalty = j_penalty_value(state["j_trace"], state["accepted_mask"], config)
         vector_ratio = maxcut_vector_ratio(benchmark, state["bloch_state"], best_known)
         vector_weight = float(config.get("vector_loss_weight", 0.0))
+        # Keep vector_weight at 0.0 for the main measurement-faithful route.
+        # Nonzero values intentionally add a full-vector auxiliary loss and
+        # should be reported separately from the Z-basis mainline.
         loss = (
             (1.0 - vector_weight) * normalized_energy
             - vector_weight * vector_ratio
@@ -593,6 +602,8 @@ def train_phase_one(config, device, output_dir):
         if epoch == 0 or epoch == int(config["epochs"]) - 1 or (epoch + 1) % int(config["log_every"]) == 0:
             if device.type == "cuda":
                 torch.cuda.synchronize()
+            # -energy/known is C(p)/known. With known=W it is expected cut
+            # fraction; with known=C* it is expected approximation ratio.
             expected_trace_ratio = -state["energy_trace"][1:] / best_known.clamp_min(1e-12)
             history.append(
                 {

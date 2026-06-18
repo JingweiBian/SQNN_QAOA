@@ -133,6 +133,10 @@ def make_train_args(config):
 
 
 def objective_ratio(benchmark, assignment, best_known):
+    # ``best_known`` controls the denominator. In current MaxCut-3 runs this
+    # is usually total edge weight W, so returned values are cut fractions C/W.
+    # Passing an exact optimum C* or a classical best-known cut changes the
+    # same field into C/C* or C/C_best_known.
     return ratio_value(benchmark, assignment, best_known)
 
 
@@ -686,6 +690,9 @@ def trace_rows(config, state, benchmark, best_known):
         rounded_energy = problem.energy(rounded)
         j_values = state["j_trace"][round_index - 1]
         stats = j_stats(j_values)
+        # For MaxCut, energy = E_QUBO(p) = -C(p). Therefore -energy / known
+        # is C(p)/known. With known=W this is expected cut fraction; with
+        # known=C* it is the strict expected approximation ratio.
         rows.append(
             {
                 "round": int(round_index),
@@ -861,6 +868,9 @@ def train_one(config, device, output_dir):
         state = model(problem, return_state=True)
         probabilities = state["probabilities"]
         energy = problem.expected_energy(probabilities)
+        # The optimized objective is the Z-basis/product-distribution MaxCut
+        # energy E_QUBO(p) = -C(p), normalized for numerical stability.
+        # This is not the full-vector diagnostic sum(1-r_i dot r_j)/2.
         normalized_energy = energy / (problem.num_variables * problem.coefficient_scale())
         progress = epoch / max(int(config["epochs"]) - 1, 1)
         entropy_weight = float(config["entropy_weight"]) * (1.0 - progress) + float(

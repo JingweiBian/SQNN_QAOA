@@ -6598,3 +6598,209 @@ teacher guidance
 deterministic rounding loss
 large final rotation / non-Z readout
 ```
+
+### 18.28 Google QAOA 论文对标与严格 approximation ratio
+
+本节补充对 `articles/Augustino 等 - 2024 - Strategies for running the QAOA at hundreds of qubits.pdf` 的对标结论。
+
+#### 18.28.1 Google 论文优化的图
+
+该论文主问题是：
+
+```text
+MaxCut on random 3-regular graphs
+```
+
+具体包括：
+
+```text
+1. 小规模 full Hilbert simulation:
+   n = 20, 24, 28
+   random 3-regular graphs
+   random bipartite 3-regular graphs
+
+2. 大规模 tensor-network simulation:
+   n = 64, 128, 256, 512
+   random 3-regular graphs
+   depth p up to 5
+```
+
+论文比较的路线：
+
+```text
+standard QAOA with tree parameters
+GW warm-start QAOA
+standard GW baseline
+```
+
+因此我们当前选择：
+
+```text
+random_regular_maxcut, average_degree = 3
+```
+
+和这篇文章的主任务是对齐的。
+
+#### 18.28.2 Google 论文使用的指标
+
+论文明确区分：
+
+```text
+cut fraction = cut edges / total edges = C / W
+approximation ratio = cut edges / maximum cut = C / C*
+```
+
+Figure 4 的纵轴写的是：
+
+```text
+Approximation ratio
+```
+
+所以如果我们要严肃对标 Google/GW/classical baseline，不能只报告：
+
+```text
+C / W
+```
+
+必须尽量报告：
+
+```text
+C / C*
+```
+
+如果 exact optimum `C*` 暂时拿不到，则报告：
+
+```text
+C / C_best_known
+```
+
+并明确它不是严格 approximation ratio，而是 best-known normalized score。
+
+#### 18.28.3 为什么我们之前先用了 C/W
+
+之前先用：
+
+```text
+cut_fraction_C_over_W = C / W
+```
+
+原因是：
+
+```text
+1. 它计算快；
+2. MaxCut-3 无权图中 W = 3n/2 很稳定；
+3. 可以快速比较不同 SQNN 变体是否切掉更多边；
+4. 不需要先求 NP-hard 的 C*。
+```
+
+但它的问题是：
+
+```text
+C/W 不是严格 approximation ratio。
+不同 graph seed 的最优 cut fraction 可能不同。
+如果要和 GW / QAOA / classical baseline 对标，C/W 不够严谨。
+```
+
+结论：
+
+```text
+C/W 只保留为快速诊断指标；
+C/C* 或 C/C_best_known 才是正式对标指标。
+```
+
+#### 18.28.4 严格 C/C* 好不好用
+
+严格 approximation ratio：
+
+```text
+alpha = C / C*
+```
+
+优点：
+
+```text
+1. 是 MaxCut 文献主流指标；
+2. 能公平比较不同图实例；
+3. 能直接和 GW 0.878 guarantee、3-regular specialized baseline、QAOA baseline 对齐；
+4. 更适合写论文和做最终 claim。
+```
+
+缺点：
+
+```text
+1. 需要知道 C*；
+2. MaxCut 是 NP-hard，大规模 exact optimum 不一定容易求；
+3. n = 512 / 1024 的随机 3-正则图可能需要专门 exact solver 或强 branch-and-cut；
+4. 如果只用 heuristic best-known，需要明确不是严格 C*。
+```
+
+因此后续采用双层指标：
+
+```text
+快速探索：
+  C / W
+
+正式对标：
+  C / C_exact       如果 exact optimum 可得
+  C / C_best_known  如果只有强 classical best-known
+```
+
+#### 18.28.5 后续基准计算要求
+
+下一步应该为每个 MaxCut-3 实例保存：
+
+```text
+graph_id
+n
+seed
+edge_count W
+our_cut C_sqnn
+our_cut_fraction C_sqnn / W
+best_known_cut C_best_known
+best_known_source
+our_ratio_to_best_known C_sqnn / C_best_known
+```
+
+如果能求 exact optimum，则保存：
+
+```text
+exact_cut C*
+exact_solver
+exact_solver_time
+our_approx_ratio C_sqnn / C*
+```
+
+baseline 至少包括：
+
+```text
+1-bit greedy local search
+multi-start greedy local search
+GW / SDP rounding if available
+specialized or exact MaxCut solver if available
+```
+
+#### 18.28.6 目标值重新解释
+
+从现在开始，目标必须写成两个版本。
+
+快速探索目标：
+
+```text
+cut_fraction_C_over_W > 0.90
+cut_fraction_C_over_W -> 0.95
+```
+
+正式对标目标：
+
+```text
+approx_ratio_C_over_Cstar > 0.90
+approx_ratio_C_over_Cstar -> 0.95
+```
+
+如果使用 best-known：
+
+```text
+C / C_best_known -> 0.95
+```
+
+这才是和 Google/GW/classical baseline 对齐的目标。

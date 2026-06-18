@@ -20,6 +20,8 @@ class MaxCutBenchmark:
     known_optimum: torch.Tensor | None = None
 
     def cut_value(self, assignments):
+        # MaxCut objective C(x) = sum_{(i,j) in E} w_ij * 1[x_i != x_j].
+        # With x_i in {0,1}, the edge indicator is x_i + x_j - 2 x_i x_j.
         x = torch.as_tensor(
             assignments,
             dtype=self.edge_weight.dtype,
@@ -34,6 +36,14 @@ class MaxCutBenchmark:
         return value.squeeze(0) if squeeze else value
 
     def approximation_ratio(self, assignments, best_known=None):
+        """Return C / denominator for a MaxCut assignment.
+
+        If ``best_known`` is the exact optimum C*, this is the strict
+        approximation ratio C/C*. If ``best_known`` is only a heuristic
+        best-known cut, this is C/C_best_known. If it falls back to
+        ``self.known_optimum`` for random-regular MaxCut, the denominator is
+        currently total edge weight W, so the result is the cut fraction C/W.
+        """
         value = self.cut_value(assignments)
         denominator = best_known
         if denominator is None:
@@ -145,6 +155,14 @@ def _generator(seed, device=None):
 
 
 def maxcut_qubo_from_edges(num_variables, edge_index, edge_weight, name="maxcut"):
+    """Build the QUBO E_QUBO(x) = -C(x) for weighted MaxCut.
+
+    For one edge (i,j), the MaxCut contribution is
+        C_ij(x) = w_ij * (x_i + x_j - 2 x_i x_j).
+    The stored QUBO energy is the negative objective:
+        E_ij(x) = -w_ij*x_i - w_ij*x_j + 2*w_ij*x_i*x_j.
+    Minimizing this QUBO is therefore equivalent to maximizing MaxCut.
+    """
     edge_index = torch.as_tensor(edge_index, dtype=torch.long)
     if edge_index.ndim == 2 and edge_index.shape[0] != 2 and edge_index.shape[1] == 2:
         edge_index = edge_index.t().contiguous()
@@ -207,8 +225,12 @@ def make_random_regular_maxcut(
     """Generate an unweighted random regular MaxCut benchmark.
 
     For ``average_degree=3`` this is the MaxCut-3 setting used in the
-    potential probes.  The denominator is total edge weight, so reported
-    ratios are cut fractions rather than exact optimum approximation ratios.
+    potential probes. In this generator every present edge has w_ij=1.
+
+    Important: ``known_optimum`` is set to total edge weight W below, not the
+    exact MaxCut optimum C*. Thus reported ratios are cut fractions C/W unless
+    the caller passes an exact optimum or a stronger best-known cut as the
+    denominator.
     """
 
     n = int(num_variables)
@@ -238,6 +260,8 @@ def make_random_regular_maxcut(
         edge_weight,
         name=f"random_regular_maxcut_n{n}_d{degree}",
     )
+    # W = sum_edges w_ij. This is a convenient denominator for quick C/W
+    # screening, but it is not the strict approximation-ratio denominator C*.
     benchmark.known_optimum = edge_weight.sum()
     return benchmark
 

@@ -158,6 +158,9 @@ def evaluate_run(row, args, device):
     benchmark.problem = benchmark.problem.to(device=device)
     benchmark.edge_index = benchmark.edge_index.to(device=device)
     benchmark.edge_weight = benchmark.edge_weight.to(device=device, dtype=benchmark.problem.linear.dtype)
+    # Current random_regular_maxcut sets known_optimum to total edge weight W,
+    # so direct_ratio/greedy_ratio below are C/W cut fractions. Replace this
+    # denominator with exact C* or C_best_known for Google-style comparisons.
     best_known = benchmark.known_optimum.to(device=device, dtype=benchmark.problem.linear.dtype)
     problem = benchmark.problem
 

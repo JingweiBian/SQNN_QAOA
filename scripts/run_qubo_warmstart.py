@@ -151,6 +151,11 @@ def objective_value(benchmark, assignment):
 
 
 def ratio_value(benchmark, assignment, best_known):
+    # The denominator determines the meaning of this value:
+    #   best_known = W              -> cut fraction C/W
+    #   best_known = exact C*       -> strict approximation ratio C/C*
+    #   best_known = best-known cut -> score against a classical baseline
+    # For random_regular_maxcut today, benchmark.known_optimum is W.
     if hasattr(benchmark, "approximation_ratio"):
         ratio = benchmark.approximation_ratio(assignment, best_known=best_known)
         if ratio is not None:

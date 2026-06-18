@@ -370,6 +370,11 @@ class QUBOProblem:
         )
 
     def energy(self, assignments):
+        # Generic sparse QUBO energy:
+        #   E(x) = constant + sum_i linear_i x_i
+        #        + sum_edges edge_weight_ij x_i x_j.
+        # For MaxCut benchmarks built by maxcut_qubo_from_edges, this equals
+        # -C(x), so minimizing this energy maximizes the cut value.
         x = torch.as_tensor(assignments, dtype=self.linear.dtype, device=self.linear.device)
         squeeze = x.ndim == 1
         if squeeze:
@@ -388,6 +393,9 @@ class QUBOProblem:
         return energy.squeeze(0) if squeeze else energy
 
     def expected_energy(self, probabilities):
+        # Independent-Bernoulli expected QUBO energy. For MaxCut this is
+        #   E(p) = - sum_edges w_ij [p_i + p_j - 2 p_i p_j],
+        # which is the negative expected cut under the product distribution.
         p = torch.as_tensor(
             probabilities,
             dtype=self.linear.dtype,

@@ -7202,3 +7202,377 @@ symmetry seed/strength
    多头不是简单平均，而是训练 head agreement 或 winner head readout；
    需要小心不要退化成 teacher / rounding loss。
 ```
+
+#### 18.29.6 Z-consistent directed-edge message probe
+
+本轮继续围绕 random 3-regular MaxCut, n=512, seed=42 做模型结构探索。重点不是改 readout threshold，也不是加入 teacher / deterministic rounding loss，而是在 SQNN 的相位演化里加入一条更贴近 MaxCut 目标的 directed-edge message。
+
+模型动机：
+
+```text
+MaxCut 的二值变量用 Z-basis 表示：
+  z_i in {-1, +1}
+
+边 (i, j) 被切开当且仅当：
+  z_i z_j = -1
+
+因此如果节点 i 当前更偏向 z_i > 0，
+那么它通过边给 j 的局部建议应该更偏向 z_j < 0。
+```
+
+新增的 Z-consistent directed-edge message 做法：
+
+```text
+1. 每条无向边拆成两个有向 message: i -> j 和 j -> i。
+2. message i -> j 根据 i 的当前 Z-belief 产生对 j 的反向建议。
+3. 更新 i -> j 时排除 j -> i 的直接回流，形成 non-backtracking / cavity 风格。
+4. 聚合所有进入节点 j 的 directed messages，得到一个 Z-consistency suggestion。
+5. 该 suggestion 不直接替代 p_j，也不直接进入 rounding loss；
+   它只作为 SQNN 内部相位/RY collapse 的结构信号，最终仍然用 Z-basis probability p_j 读出。
+```
+
+新增主线配置：
+
+```text
+phase_mode = memory_xy_feedback_z_edge_cavity_collapse
+phase_mode = memory_xy_feedback_neighbor_xy_z_edge_cavity_collapse
+
+z_message_decay = 0.70
+z_message_self_mix = 0.50
+z_message_gain = 1.0
+collapse_init = 0.03
+final_rotation_max = 0.05
+```
+
+本轮结果：
+
+```text
+outputs/maxcut3_v14_z_edge_probe/
+
+memory_xy_feedback_z_edge_cavity_collapse:
+  direct + 1-bit greedy C/W = 0.897135
+  sample + 1-bit greedy C/W = 0.898438
+  expected C/W = 0.886379
+
+memory_xy_feedback_neighbor_xy_z_edge_cavity_collapse:
+  direct + 1-bit greedy C/W = 0.890625
+  sample + 1-bit greedy C/W = 0.899740
+  expected C/W = 0.866194
+
+8192-sample readout rescore:
+  best sample + 1-bit greedy C/W = 0.902344
+```
+
+阶段性判断：
+
+```text
+1. Z-consistent directed-edge message 是目前最有价值的新方向。
+2. deterministic direct + 1-bit greedy 从 0.895833 提升到 0.897135，
+   说明直接读出的概率结构确实被改善了。
+3. 8192-sample readout 首次越过 0.90，到达 0.902344，
+   说明 SQNN 概率分布中已经稳定包含超过 0.90 的可读出解。
+4. 当前 direct readout 仍未稳定越过 0.90，
+   下一轮应该继续优化分布本身，而不是继续主要调整 threshold。
+```
+
+下一轮优先探索：
+
+```text
+1. z_message_decay / z_message_self_mix / z_message_gain 的小规模结构扫描。
+2. Z-edge 与 small final global rotation 的耦合强度。
+3. residual-core second-stage SQNN：
+   用第一阶段固定高置信变量，再只对低置信 residual core 做第二段 SQNN，
+   仍然保持模型主线为 SQNN，不接外部 QAOA。
+4. high-sample >0.90 的来源分析：
+   检查这些好样本相对 direct rounding 的差异变量，
+   判断 direct 卡住是少数变量符号错误，还是概率分布整体不够尖锐。
+```
+
+#### 18.29.7 Z-edge 参数扫描与 direct/sample gap 分析
+
+继续围绕 `memory_xy_feedback_z_edge_cavity_collapse` 做小规模结构扫描。扫描目标不是调 threshold，而是判断 Z-consistent directed-edge message 的三个结构量哪个最关键：
+
+```text
+z_message_decay:
+  directed message 的历史记忆长度。
+
+z_message_self_mix:
+  节点自身当前 Z-belief 与 incoming cavity belief 的混合比例。
+
+z_message_gain:
+  MaxCut 反向建议的强度。
+```
+
+输出位置：
+
+```text
+outputs/maxcut3_v14_z_edge_param_probe/
+outputs/maxcut3_v14_z_edge_param_rescore_8192/
+outputs/maxcut3_v14_z_edge_readout_gap/
+```
+
+参数扫描结果：
+
+```text
+z_message_gain = 1.8:
+  direct + 1-bit greedy C/W = 0.897135
+  256-sample + 1-bit greedy C/W = 0.902344
+  8192-sample + 1-bit greedy C/W = 0.904948
+
+z_message_gain = 0.6:
+  direct + 1-bit greedy C/W = 0.891927
+  sample + 1-bit greedy C/W = 0.894531
+
+z_message_self_mix = 0.25:
+  direct + 1-bit greedy C/W = 0.891927
+  sample + 1-bit greedy C/W = 0.895833
+
+z_message_self_mix = 0.75:
+  direct + 1-bit greedy C/W = 0.895833
+  sample + 1-bit greedy C/W = 0.898438
+
+z_message_decay = 0.45 / 0.85:
+  direct + 1-bit greedy C/W = 0.895833
+  sample + 1-bit greedy C/W = 0.897135
+```
+
+判断：
+
+```text
+1. gain 是目前最关键的 Z-edge 参数。
+   反向建议太弱时，direct 和 sample 都下降。
+
+2. 提高 gain 可以明显抬高分布上限：
+   8192-sample readout 从 0.902344 进一步到 0.904948。
+
+3. direct readout 仍停在 0.897135，
+   说明当前瓶颈不是单纯采样数，而是 deterministic readout 没能同步翻转一个相关变量块。
+```
+
+direct/sample gap 分析：
+
+```text
+对比同一 run、同一 round_index=249：
+
+direct + 1-bit greedy C/W = 0.897135
+best 8192-sample + 1-bit greedy C/W = 0.904948
+ratio gain = 0.0078125
+
+changed variables = 38
+changed confidence mean = 0.461
+unchanged confidence mean = 0.884
+changed confidence < 0.50 的变量数 = 20
+
+gained cut edges = 27
+lost cut edges = 21
+net cut edges = 6
+
+changed-variable component sizes:
+  19, 8, 3, 2, 2, 2, 2
+```
+
+这说明最优 sample 相对 direct 不是只改了几个孤立点，而是翻转了一个最大 19 个变量的相关 residual block。当前 direct 卡住的原因更像是“局部相关块的共同取向没有被确定性读出同步捕捉”，而不是 `p_i >= 0.5` 阈值本身太粗。
+
+下一步主线：
+
+```text
+1. residual-core second-stage SQNN：
+   第一阶段固定高置信变量，对低置信/changed-like residual block 再跑第二段 SQNN。
+
+2. block-aware Z-edge phase：
+   不只传单条边的一阶反向建议，还让相位记忆感知多个 incoming messages 的一致性。
+
+3. gain schedule：
+   早期较低 gain 保持探索，后期逐渐增强 Z-consistent message，
+   目标是把 sample 中出现的好 block 变成 direct readout 的稳定输出。
+```
+
+#### 18.29.8 Gain schedule 反证结果
+
+基于 18.29.7 的判断，继续测试两个更强 Z-edge gain 方案：
+
+```text
+outputs/maxcut3_v14_z_edge_gain_schedule_probe/
+outputs/maxcut3_v14_z_edge_gain_schedule_rescore_8192/
+
+方案 A:
+  z_message_gain = 2.6
+
+方案 B:
+  z_message_gain = 1.0
+  z_message_gain_final = 2.6
+  z_message_gain_schedule_start = 0.60
+```
+
+结果：
+
+```text
+固定 gain=2.6:
+  direct + 1-bit greedy C/W = 0.897135
+  256-sample + 1-bit greedy C/W = 0.899740
+  8192-sample + 1-bit greedy C/W = 0.901042
+  expected C/W = 0.890335
+
+gain 1.0 -> 2.6 schedule:
+  direct + 1-bit greedy C/W = 0.895833
+  256-sample + 1-bit greedy C/W = 0.897135
+  expected C/W = 0.888452
+```
+
+对比当前最好：
+
+```text
+z_message_gain = 1.8:
+  direct + 1-bit greedy C/W = 0.897135
+  256-sample + 1-bit greedy C/W = 0.902344
+  8192-sample + 1-bit greedy C/W = 0.904948
+```
+
+结论：
+
+```text
+1. Z-edge gain 不是越强越好。
+2. gain=2.6 会让 expected C/W 变高，但 sample/readout 上限下降，
+   说明概率分布可能更自信，但没有更好地覆盖高质量 cut block。
+3. 简单 late gain schedule 没有把 sample 中的好 block 转成 direct 输出。
+4. 下一步更值得做的是：
+   - 围绕 gain=1.4~2.0 细扫；
+   - 或直接做 residual-core second-stage SQNN；
+   - 或设计 block-aware Z-edge message，而不是继续单边增强 gain。
+```
+
+#### 18.29.9 Z-edge gain 细扫突破 direct 0.90
+
+继续围绕 `z_message_gain` 的有效区间做细扫：
+
+```text
+outputs/maxcut3_v14_z_edge_gain_fine_probe/
+outputs/maxcut3_v14_z_edge_gain_fine_rescore_8192/
+outputs/maxcut3_v14_z_edge_gain_fine_readout_gap/
+
+测试：
+  z_message_gain = 1.4
+  z_message_gain = 1.6
+  z_message_gain = 2.0
+```
+
+结果：
+
+```text
+z_message_gain = 1.4:
+  direct + 1-bit greedy C/W = 0.901042
+  256-sample + 1-bit greedy C/W = 0.903646
+  8192-sample + 1-bit greedy C/W = 0.906250
+  expected C/W = 0.883622
+
+z_message_gain = 1.6:
+  direct + 1-bit greedy C/W = 0.895833
+  sample + 1-bit greedy C/W = 0.898438
+  expected C/W = 0.884862
+
+z_message_gain = 2.0:
+  direct + 1-bit greedy C/W = 0.895833
+  sample + 1-bit greedy C/W = 0.898438
+  expected C/W = 0.886929
+```
+
+这是当前 MaxCut-3, n=512, seed=42 上纯 V14/Z-edge SQNN 主线的最好结果：
+
+```text
+best direct + 1-bit greedy C/W = 0.901042
+best high-sample + 1-bit greedy C/W = 0.906250
+low-rank GW-style + 1-bit greedy baseline C/W = 0.917969
+
+gap to GW-style baseline:
+  direct gap = 0.016927
+  high-sample gap = 0.011719
+```
+
+重要判断：
+
+```text
+1. direct readout 已经突破 0.90。
+   这说明提升来自 SQNN 概率分布本身，而不是后处理 threshold 技巧。
+
+2. gain=1.4 优于 1.8 / 2.0 / 2.6。
+   Z-consistent message 需要足够强，但过强会损害能读出的高质量 cut block。
+
+3. expected C/W 与最终二值解质量并不完全同向。
+   gain=2.6 的 expected 更高，但 direct/sample 更差。
+   因此后续不能只看 expected objective，还要同步看 direct、sample 和 residual gap。
+```
+
+新的 direct/sample gap 分析：
+
+```text
+direct + 1-bit greedy C/W = 0.901042
+best 8192-sample + 1-bit greedy C/W = 0.906250
+ratio gain = 0.005208
+
+changed variables = 34
+changed confidence mean = 0.568
+unchanged confidence mean = 0.825
+
+gained cut edges = 26
+lost cut edges = 22
+net cut edges = 4
+
+changed-variable component sizes:
+  8, 5, 5, 5, 4, 3, 2, 2
+```
+
+对比上一轮 `gain=1.8` 的 gap，最大变化块从 19 降到 8，说明 `gain=1.4` 不只是提高分数，还把 residual correlated block 变小了。下一步如果要继续接近 GW，优先方向应是：
+
+```text
+1. 围绕 gain=1.2~1.5 做更细局部扫描。
+2. 对 remaining residual blocks 做 second-stage SQNN。
+3. 设计 block-aware Z-edge message，让多个 incoming messages 的一致性影响 collapse。
+```
+
+#### 18.29.10 Gain finer sweep: 1.4 是当前窄甜点
+
+继续验证 `gain=1.4` 是否是稳定平台，测试：
+
+```text
+outputs/maxcut3_v14_z_edge_gain_finer_probe/
+
+z_message_gain = 1.2
+z_message_gain = 1.3
+z_message_gain = 1.5
+```
+
+结果：
+
+```text
+z_message_gain = 1.2:
+  direct + 1-bit greedy C/W = 0.895833
+  sample + 1-bit greedy C/W = 0.898438
+  expected C/W = 0.886558
+
+z_message_gain = 1.3:
+  direct + 1-bit greedy C/W = 0.897135
+  sample + 1-bit greedy C/W = 0.899740
+  expected C/W = 0.881411
+
+z_message_gain = 1.5:
+  direct + 1-bit greedy C/W = 0.897135
+  sample + 1-bit greedy C/W = 0.898438
+  expected C/W = 0.887953
+```
+
+结论：
+
+```text
+1. 当前最好仍是 z_message_gain=1.4：
+   direct C/W = 0.901042
+   8192-sample C/W = 0.906250
+
+2. 甜点区间很窄。
+   1.3 和 1.5 都没有保住 direct 0.90。
+
+3. 下一步不应继续大范围扫单一 gain。
+   更值得转向：
+   - residual-core second-stage SQNN；
+   - block-aware Z-edge message；
+   - 多 seed / n=1024 稳定性测试。
+```

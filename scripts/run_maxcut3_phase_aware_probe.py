@@ -55,6 +55,11 @@ EXTRA_SUMMARY_FIELDS = [
     "final_rotation_max",
     "edge_message_decay",
     "edge_message_self_mix",
+    "z_message_decay",
+    "z_message_self_mix",
+    "z_message_gain",
+    "z_message_gain_final",
+    "z_message_gain_schedule_start",
     "head_count",
     "head_seed_stride",
     "node_step_mode",
@@ -100,6 +105,11 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         final_rotation_max=0.0,
         edge_message_decay=0.70,
         edge_message_self_mix=0.50,
+        z_message_decay=0.70,
+        z_message_self_mix=0.50,
+        z_message_gain=1.0,
+        z_message_gain_final=None,
+        z_message_gain_schedule_start=0.60,
         node_step_mode="none",
     ):
         super().__init__()
@@ -123,6 +133,13 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         self.final_rotation_max = float(final_rotation_max)
         self.edge_message_decay = float(edge_message_decay)
         self.edge_message_self_mix = float(edge_message_self_mix)
+        self.z_message_decay = float(z_message_decay)
+        self.z_message_self_mix = float(z_message_self_mix)
+        self.z_message_gain = float(z_message_gain)
+        self.z_message_gain_final = (
+            None if z_message_gain_final is None else float(z_message_gain_final)
+        )
+        self.z_message_gain_schedule_start = float(z_message_gain_schedule_start)
         self.node_step_mode = str(node_step_mode)
 
         if initial_probabilities is None:
@@ -367,6 +384,77 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         alignment = bloch[:, 0] * node_message[:, 0] + bloch[:, 1] * node_message[:, 1]
         return torque, alignment, next_message
 
+    def _current_z_message_gain(self, round_index):
+        if self.z_message_gain_final is None:
+            return float(self.z_message_gain)
+        start_fraction = min(max(float(self.z_message_gain_schedule_start), 0.0), 1.0)
+        start_round = int(round(float(self.message_rounds) * start_fraction))
+        if round_index <= start_round:
+            return float(self.z_message_gain)
+        denominator = max(int(self.message_rounds) - 1 - start_round, 1)
+        progress = min(max((int(round_index) - start_round) / float(denominator), 0.0), 1.0)
+        return float(self.z_message_gain) + progress * (
+            float(self.z_message_gain_final) - float(self.z_message_gain)
+        )
+
+    def _edge_z_cavity_signal(self, problem, probabilities, edge_z_message, z_message_gain=None):
+        if problem.edge_index.numel() == 0:
+            zeros = torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
+            return zeros, zeros, edge_z_message
+
+        src, dst = problem.edge_index
+        edge_count = int(src.numel())
+        tail = torch.cat((src, dst), dim=0)
+        head = torch.cat((dst, src), dim=0)
+        reverse = torch.cat(
+            (
+                torch.arange(edge_count, 2 * edge_count, device=self.device),
+                torch.arange(0, edge_count, device=self.device),
+            ),
+            dim=0,
+        )
+        edge_weight = problem.edge_weight.to(device=self.device, dtype=self.dtype).abs()
+        directed_weight = torch.cat((edge_weight, edge_weight), dim=0)
+        z_value = 2.0 * probabilities.to(device=self.device, dtype=self.dtype) - 1.0
+
+        if edge_z_message.numel() != 2 * edge_count:
+            edge_z_message = -z_value[tail]
+        else:
+            edge_z_message = edge_z_message.to(device=self.device, dtype=self.dtype)
+
+        incoming = torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
+        incoming.index_add_(0, head, directed_weight * edge_z_message)
+
+        degree = problem.node_degrees(weighted=True, absolute=True).to(device=self.device, dtype=self.dtype)
+        cavity_degree = (degree[tail] - directed_weight).clamp_min(1.0)
+        cavity_tail_belief = (incoming[tail] - directed_weight * edge_z_message[reverse]) / cavity_degree
+
+        self_mix = torch.as_tensor(
+            min(max(float(self.z_message_self_mix), 0.0), 1.0),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        if z_message_gain is None:
+            z_message_gain = self.z_message_gain
+        gain = torch.as_tensor(max(float(z_message_gain), 1e-6), dtype=self.dtype, device=self.device)
+        tail_belief = self_mix * z_value[tail] + (1.0 - self_mix) * cavity_tail_belief
+        # MaxCut wants opposite Z signs across an edge, so tail->head suggests
+        # the negative of tail's non-backtracking cavity belief.
+        raw_message = -torch.tanh(gain * tail_belief)
+
+        decay = torch.as_tensor(
+            min(max(float(self.z_message_decay), 0.0), 1.0),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        next_message = (decay * edge_z_message + (1.0 - decay) * raw_message).clamp(-1.0, 1.0)
+
+        node_suggestion = torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
+        node_suggestion.index_add_(0, head, directed_weight * next_message)
+        node_suggestion = (node_suggestion / degree.clamp_min(1e-6)).clamp(-1.0, 1.0)
+        z_error = (node_suggestion - z_value).clamp(-1.0, 1.0)
+        return z_error, node_suggestion, next_message
+
     def _node_step_scale(self, local_field, old_probabilities):
         if self.node_step_mode != "learned_gate":
             return 1.0
@@ -401,6 +489,7 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         round_index,
         phase_memory,
         edge_message,
+        edge_z_message,
     ):
         next_phase_memory = phase_memory
         phase_signal = local_field
@@ -416,12 +505,20 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
             bloch,
             edge_message,
         )
+        z_edge_error, z_edge_suggestion, next_edge_z_message = self._edge_z_cavity_signal(
+            problem,
+            old_probabilities,
+            edge_z_message,
+            self._current_z_message_gain(round_index),
+        )
         phase_diff_signal = self._phase_difference_signal(problem, bloch)
         relation_signal = neighbor_torque
         if "cavity_xy" in self.phase_mode and "edge_cavity_xy" not in self.phase_mode:
             relation_signal = cavity_torque
         if "edge_cavity_xy" in self.phase_mode:
             relation_signal = edge_cavity_torque
+        if "z_edge_cavity" in self.phase_mode:
+            relation_signal = z_edge_error
         if "phase_diff" in self.phase_mode:
             relation_signal = phase_diff_signal
 
@@ -475,7 +572,7 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
 
         proposed_probabilities = self._probabilities_from_bloch(proposal)
         final_j = -local_field * (proposed_probabilities - old_probabilities)
-        return proposal, next_phase_memory, next_edge_message, {
+        return proposal, next_phase_memory, next_edge_message, next_edge_z_message, {
             "raw_j": raw_j,
             "j": final_j,
             "after_rz_x": after_rz[:, 0],
@@ -486,6 +583,8 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
             "cavity_alignment": cavity_alignment,
             "edge_cavity_torque": edge_cavity_torque,
             "edge_cavity_alignment": edge_cavity_alignment,
+            "z_edge_error": z_edge_error,
+            "z_edge_suggestion": z_edge_suggestion,
             "phase_diff_signal": phase_diff_signal,
         }
 
@@ -507,11 +606,12 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         phase_angle_trace = []
         phase_memory = torch.zeros_like(probabilities)
         edge_message = torch.empty(0, dtype=self.dtype, device=self.device)
+        edge_z_message = torch.empty(0, dtype=self.dtype, device=self.device)
 
         for round_index in range(self.message_rounds):
             old_probabilities = probabilities
             local_field = self._local_field(problem, old_probabilities)
-            proposed_bloch, phase_memory, edge_message, diagnostics = self._propose_round(
+            proposed_bloch, phase_memory, edge_message, edge_z_message, diagnostics = self._propose_round(
                 problem,
                 bloch,
                 local_field,
@@ -519,6 +619,7 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
                 round_index,
                 phase_memory,
                 edge_message,
+                edge_z_message,
             )
             proposed_probabilities = self._probabilities_from_bloch(proposed_bloch)
             proposed_energy = problem.expected_energy(proposed_probabilities)
@@ -778,6 +879,11 @@ def build_variants(base, rounds, epochs):
         final_rotation_max=0.0,
         edge_message_decay=0.70,
         edge_message_self_mix=0.50,
+        z_message_decay=0.70,
+        z_message_self_mix=0.50,
+        z_message_gain=1.0,
+        z_message_gain_final="",
+        z_message_gain_schedule_start=0.60,
         head_count=1,
         head_seed_stride=7919,
         node_step_mode="none",
@@ -846,6 +952,233 @@ def build_variants(base, rounds, epochs):
                 collapse_init=0.03,
                 edge_message_decay=0.70,
                 edge_message_self_mix=0.50,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_cavity_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.0,
+            ),
+        ),
+        (
+            "v14_memory_xy_neighbor_z_edge_cavity_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_neighbor_xy_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                neighbor_phase_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.0,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_decay045_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.45,
+                z_message_self_mix=0.50,
+                z_message_gain=1.0,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_decay085_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.85,
+                z_message_self_mix=0.50,
+                z_message_gain=1.0,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_selfmix025_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.25,
+                z_message_gain=1.0,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_selfmix075_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.75,
+                z_message_gain=1.0,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_gain06_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=0.6,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_gain18_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.8,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_gain14_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.4,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_gain12_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_gain13_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.3,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_gain15_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.5,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_gain16_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.6,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_gain20_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=2.0,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_gain_schedule_1p0_2p6_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.0,
+                z_message_gain_final=2.6,
+                z_message_gain_schedule_start=0.60,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_gain26_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=2.6,
             ),
         ),
         (
@@ -1032,6 +1365,15 @@ def train_phase_one(config, device, output_dir):
         final_rotation_max=float(config.get("final_rotation_max", 0.0)),
         edge_message_decay=float(config.get("edge_message_decay", 0.70)),
         edge_message_self_mix=float(config.get("edge_message_self_mix", 0.50)),
+        z_message_decay=float(config.get("z_message_decay", 0.70)),
+        z_message_self_mix=float(config.get("z_message_self_mix", 0.50)),
+        z_message_gain=float(config.get("z_message_gain", 1.0)),
+        z_message_gain_final=(
+            None
+            if config.get("z_message_gain_final", "") in {"", None}
+            else float(config.get("z_message_gain_final"))
+        ),
+        z_message_gain_schedule_start=float(config.get("z_message_gain_schedule_start", 0.60)),
         node_step_mode=config.get("node_step_mode", "none"),
     )
     if int(config.get("head_count", 1)) > 1:

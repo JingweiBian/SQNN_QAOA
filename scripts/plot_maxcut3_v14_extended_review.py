@@ -141,8 +141,11 @@ def plot(output_dir, rows, baselines, rescore_reports):
     axes[0].legend(fontsize=8)
 
     axes[1].scatter(expected, direct, color="#54a24b", s=36)
-    for row, x_value, y_value in zip(ranked, expected, direct):
-        axes[1].annotate(short_label(row)[:18], (x_value, y_value), fontsize=6, alpha=0.75)
+    best_expected_index = max(range(len(ranked)), key=lambda index: expected[index]) if ranked else -1
+    for index, (row, x_value, y_value) in enumerate(zip(ranked, expected, direct)):
+        if index not in {0, best_expected_index}:
+            continue
+        axes[1].annotate(short_label(row)[:22], (x_value, y_value), fontsize=7, alpha=0.85)
     axes[1].set_xlabel("expected C/W")
     axes[1].set_ylabel("direct+1-bit greedy C/W")
     axes[1].grid(alpha=0.25)
@@ -194,6 +197,11 @@ def main():
         ("edge_cavity", "outputs/maxcut3_v14_edge_cavity_probe/summary.csv"),
         ("multihead", "outputs/maxcut3_v14_multihead_probe/summary.csv"),
         ("entropy", "outputs/maxcut3_v14_entropy_schedule_probe/summary.csv"),
+        ("z_edge", "outputs/maxcut3_v14_z_edge_probe/summary.csv"),
+        ("z_edge_param", "outputs/maxcut3_v14_z_edge_param_probe/summary.csv"),
+        ("z_edge_gain_schedule", "outputs/maxcut3_v14_z_edge_gain_schedule_probe/summary.csv"),
+        ("z_edge_gain_fine", "outputs/maxcut3_v14_z_edge_gain_fine_probe/summary.csv"),
+        ("z_edge_gain_finer", "outputs/maxcut3_v14_z_edge_gain_finer_probe/summary.csv"),
     ]
     rows = []
     for source, path in summary_specs:
@@ -204,6 +212,10 @@ def main():
         or [
             Path("outputs/maxcut3_v14_readout_rescore_chunked2_samples_8192/phase_readout_rescore_report.json"),
             Path("outputs/maxcut3_v14_edge_cavity_rescore_8192/phase_readout_rescore_report.json"),
+            Path("outputs/maxcut3_v14_z_edge_rescore_8192/phase_readout_rescore_report.json"),
+            Path("outputs/maxcut3_v14_z_edge_param_rescore_8192/phase_readout_rescore_report.json"),
+            Path("outputs/maxcut3_v14_z_edge_gain_schedule_rescore_8192/phase_readout_rescore_report.json"),
+            Path("outputs/maxcut3_v14_z_edge_gain_fine_rescore_8192/phase_readout_rescore_report.json"),
         ]
     )
     write_report(args.output_dir, rows, baselines, rescore_reports)

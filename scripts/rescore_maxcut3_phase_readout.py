@@ -63,6 +63,15 @@ def build_phase_model(config, problem, device):
         final_rotation_max=float(config.get("final_rotation_max", 0.0)),
         edge_message_decay=float(config.get("edge_message_decay", 0.70)),
         edge_message_self_mix=float(config.get("edge_message_self_mix", 0.50)),
+        z_message_decay=float(config.get("z_message_decay", 0.70)),
+        z_message_self_mix=float(config.get("z_message_self_mix", 0.50)),
+        z_message_gain=float(config.get("z_message_gain", 1.0)),
+        z_message_gain_final=(
+            None
+            if config.get("z_message_gain_final", "") in {"", None}
+            else float(config.get("z_message_gain_final"))
+        ),
+        z_message_gain_schedule_start=float(config.get("z_message_gain_schedule_start", 0.60)),
         node_step_mode=config.get("node_step_mode", "none"),
     )
     if int(config.get("head_count", 1)) > 1:

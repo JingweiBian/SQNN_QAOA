@@ -203,6 +203,15 @@ def config_from_row(base, args, row, phase, rounds, epochs, overrides=None, seed
             "final_rotation_max": as_float(row.get("final_rotation_max"), 0.0),
             "edge_message_decay": as_float(row.get("edge_message_decay"), 0.70),
             "edge_message_self_mix": as_float(row.get("edge_message_self_mix"), 0.50),
+            "z_message_decay": as_float(row.get("z_message_decay"), 0.70),
+            "z_message_self_mix": as_float(row.get("z_message_self_mix"), 0.50),
+            "z_message_gain": as_float(row.get("z_message_gain"), 1.0),
+            "z_message_gain_final": (
+                ""
+                if row.get("z_message_gain_final", "") in {"", None}
+                else as_float(row.get("z_message_gain_final"), 0.0)
+            ),
+            "z_message_gain_schedule_start": as_float(row.get("z_message_gain_schedule_start"), 0.60),
             "head_count": int(as_float(row.get("head_count"), 1)),
             "head_seed_stride": int(as_float(row.get("head_seed_stride"), 7919)),
             "trust_mode": row.get("trust_mode", config.get("trust_mode", "two_stage")) or "two_stage",
@@ -377,6 +386,43 @@ def propose_next_cycle(base, args, cycle, summary_rows):
                     base,
                     args,
                     row,
+                    f"{base_name}_mem_xy_z_edge_collapse",
+                    base_rounds,
+                    base_epochs,
+                    {
+                        "phase_mode": "memory_xy_feedback_z_edge_cavity_collapse",
+                        "collapse_init": 0.03,
+                        "final_rotation_max": 0.05,
+                        "z_message_decay": 0.70,
+                        "z_message_self_mix": 0.50,
+                        "z_message_gain": 1.0,
+                    },
+                )
+            )
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
+                    f"{base_name}_mem_xy_neighbor_z_edge_collapse",
+                    base_rounds,
+                    base_epochs,
+                    {
+                        "phase_mode": "memory_xy_feedback_neighbor_xy_z_edge_cavity_collapse",
+                        "neighbor_phase_init": 0.05,
+                        "collapse_init": 0.03,
+                        "final_rotation_max": 0.05,
+                        "z_message_decay": 0.70,
+                        "z_message_self_mix": 0.50,
+                        "z_message_gain": 1.0,
+                    },
+                )
+            )
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
                     f"{base_name}_mem_xy_cavity",
                     base_rounds,
                     base_epochs,
@@ -479,6 +525,89 @@ def propose_next_cycle(base, args, cycle, summary_rows):
                     {"edge_message_self_mix": 0.75},
                 )
             )
+        if "z_edge_cavity" in mode:
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
+                    f"{base_name}_z_decay_045",
+                    base_rounds,
+                    base_epochs,
+                    {"z_message_decay": 0.45},
+                )
+            )
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
+                    f"{base_name}_z_decay_085",
+                    base_rounds,
+                    base_epochs,
+                    {"z_message_decay": 0.85},
+                )
+            )
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
+                    f"{base_name}_z_selfmix_025",
+                    base_rounds,
+                    base_epochs,
+                    {"z_message_self_mix": 0.25},
+                )
+            )
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
+                    f"{base_name}_z_gain_1p4",
+                    base_rounds,
+                    base_epochs,
+                    {"z_message_gain": 1.4, "z_message_gain_final": ""},
+                )
+            )
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
+                    f"{base_name}_z_gain_1p8",
+                    base_rounds,
+                    base_epochs,
+                    {"z_message_gain": 1.8},
+                )
+            )
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
+                    f"{base_name}_z_gain_2p6",
+                    base_rounds,
+                    base_epochs,
+                    {"z_message_gain": 2.6, "z_message_gain_final": ""},
+                )
+            )
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
+                    f"{base_name}_z_gain_sched_1p0_2p6",
+                    base_rounds,
+                    base_epochs,
+                    {
+                        "z_message_gain": 1.0,
+                        "z_message_gain_final": 2.6,
+                        "z_message_gain_schedule_start": 0.60,
+                    },
+                )
+            )
+        if "memory_xy_feedback" in mode:
             configs.append(
                 config_from_row(
                     base,

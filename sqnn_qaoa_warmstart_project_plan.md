@@ -7576,3 +7576,82 @@ z_message_gain = 1.5:
    - block-aware Z-edge message；
    - 多 seed / n=1024 稳定性测试。
 ```
+
+#### 18.29.11 Residual-core second-stage SQNN
+
+基于 `z_message_gain=1.4` 的第一阶段最佳结果，测试第二阶段 residual SQNN：
+
+```text
+第一阶段：
+  run = v14_memory_xy_z_edge_gain14_collapse
+  round_index = 252
+  stage-1 direct + 1-bit greedy C/W = 0.901042
+  stage-1 8192-sample + 1-bit greedy C/W = 0.906250
+
+第二阶段：
+  固定 confidence = |2p_i - 1| 高于阈值的变量；
+  fixed value 使用第一阶段 direct+1-bit greedy assignment；
+  对剩余 residual QUBO 重新训练一个 Z-edge SQNN；
+  最后把 residual 解嵌回原图，计算完整 MaxCut C/W。
+```
+
+输出位置：
+
+```text
+outputs/maxcut3_v14_residual_sqnn_gain14_probe/
+outputs/maxcut3_v14_residual_sqnn_gain14_threshold_fine_probe/
+outputs/maxcut3_v14_residual_sqnn_gain14_rescore_8192/
+```
+
+主要结果：
+
+```text
+threshold = 0.85:
+  fixed variables = 323
+  residual variables = 189
+  residual edges = 117
+  stage-2 direct C/W = 0.903646
+  stage-2 8192-sample C/W = 0.904948
+
+threshold = 0.86:
+  fixed variables = 274
+  residual variables = 238
+  residual edges = 162
+  stage-2 direct C/W = 0.903646
+  stage-2 8192-sample C/W = 0.904948
+
+threshold = 0.87:
+  fixed variables = 174
+  residual variables = 338
+  residual edges = 298
+  stage-2 direct C/W = 0.852865
+  stage-2 sample C/W = 0.876302
+```
+
+阶段性判断：
+
+```text
+1. residual-core second-stage SQNN 能改善 deterministic direct readout：
+   0.901042 -> 0.903646。
+
+2. 但它没有超过第一阶段 8192-sample 上限：
+   stage-1 sample = 0.906250
+   stage-2 sample = 0.904948
+
+3. residual 阈值窗口很窄。
+   0.85/0.86 有效，0.87 开始崩，0.88/0.90 更差。
+   原因是固定变量太少时，第二阶段接近重训大图，80 epoch 不够稳定；
+   固定变量太多时，又没有足够自由度修正 cut block。
+```
+
+结论：
+
+```text
+second-stage SQNN 是有价值的 direct-readout 修复机制，
+但目前不是突破 GW gap 的主要来源。
+
+下一步如果继续该方向，应尝试：
+1. 只对 residual connected components 独立训练，而不是整个 residual 一起训练；
+2. 对 residual 使用更长 epoch / 更低 lr 的稳定训练；
+3. 不固定所有高置信变量，而是按 edge boundary risk 选择固定集合。
+```

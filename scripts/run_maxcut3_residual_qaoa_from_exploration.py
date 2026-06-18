@@ -18,7 +18,11 @@ SCRIPTS_DIR = ROOT_DIR / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from explore_j_regularized_sqnn import JRegularizedSyncLocalSQNN, make_train_args  # noqa: E402
+from explore_j_regularized_sqnn import (  # noqa: E402
+    JRegularizedSyncLocalSQNN,
+    make_train_args,
+    make_warm_start_probabilities,
+)
 from run_qubo_warmstart import make_benchmark, ratio_value  # noqa: E402
 from quantum.warmstart import (  # noqa: E402
     greedy_local_search,
@@ -44,7 +48,8 @@ def load_summary(summary_path):
         return {row["run_id"]: row for row in csv.DictReader(file_obj)}
 
 
-def build_model(config, problem, device):
+def build_model(config, benchmark, problem, device):
+    warm_start_probabilities, _ = make_warm_start_probabilities(config, benchmark, problem, device)
     return JRegularizedSyncLocalSQNN(
         num_variables=problem.num_variables,
         message_rounds=int(config["rounds"]),
@@ -59,6 +64,7 @@ def build_model(config, problem, device):
         symmetry_strength_trainable=bool(config.get("symmetry_strength_trainable", False)),
         symmetry_strength_max=float(config.get("symmetry_strength_max", 0.5)),
         symmetry_seed=int(config.get("symmetry_seed", config["seed"])),
+        initial_probabilities=warm_start_probabilities,
     ).to(device)
 
 
@@ -114,6 +120,37 @@ def optimize_componentwise(
     }
 
 
+def optimize_full_active(
+    active_problem,
+    active_probabilities,
+    layers,
+    steps,
+    lr,
+    restarts,
+    device,
+    seed,
+):
+    best_result = None
+    for restart in range(int(restarts)):
+        result = optimize_qaoa_statevector(
+            active_problem,
+            initial_probabilities=active_probabilities,
+            layers=layers,
+            steps=steps,
+            lr=lr,
+            device=device,
+            seed=int(seed) + restart,
+        )
+        if best_result is None or result["best"]["expected_energy"] < best_result["best"]["expected_energy"]:
+            best_result = result
+    return {
+        "expected_energy": float(best_result["best"]["expected_energy"]),
+        "exact_energy": float(best_result["exact_min_energy"]),
+        "num_states": int(best_result["num_states"]),
+        "best_step": int(best_result["best"]["step"]),
+    }
+
+
 def evaluate_run(run_label, run_id, args, device, summary_rows):
     run_dir = args.exploration_dir / "runs" / run_id
     payload = torch.load(run_dir / "model.pt", map_location="cpu", weights_only=False)
@@ -127,7 +164,7 @@ def evaluate_run(run_label, run_id, args, device, summary_rows):
     best_known = benchmark.known_optimum.to(device=device, dtype=benchmark.problem.linear.dtype)
     problem = benchmark.problem
 
-    model = build_model(config, problem, device)
+    model = build_model(config, benchmark, problem, device)
     model.load_state_dict(payload["model_state_dict"], strict=False)
     model.eval()
     with torch.no_grad():
@@ -276,6 +313,43 @@ def evaluate_run(run_label, run_id, args, device, summary_rows):
                     "qaoa_note": "componentwise_p2",
                 }
             )
+            if bool(args.include_full_active) and active_variables <= int(args.max_full_qubits):
+                full_result = optimize_full_active(
+                    active_reduced,
+                    init_probabilities,
+                    layers=2,
+                    steps=args.steps,
+                    lr=args.lr,
+                    restarts=args.restarts,
+                    device=device,
+                    seed=int(config["seed"]) + int(round(1000 * float(threshold))) + 50000,
+                )
+                rows.append(
+                    {
+                        "run_label": run_label,
+                        "run_id": run_id,
+                        "n": int(config["n"]),
+                        "threshold": float(threshold),
+                        "fixed_variables": fixed_count,
+                        "remaining_variables": int(reduced.num_variables),
+                        "isolated_variables": isolated_variables,
+                        "active_variables": active_variables,
+                        "active_edges": active_edges,
+                        "max_component_variables": max_component,
+                        "rounded_ratio": rounded_ratio,
+                        "rounded_greedy_ratio": rounded_greedy_ratio,
+                        "rounded_greedy_flips": int(rounded_greedy_flips),
+                        "qaoa_init": init_name,
+                        "qaoa_p2_expected_ratio": float(
+                            -full_result["expected_energy"] / float(best_known.detach().cpu())
+                        ),
+                        "exact_residual_ratio": float(
+                            -full_result["exact_energy"] / float(best_known.detach().cpu())
+                        ),
+                        "qaoa_components": 1,
+                        "qaoa_note": "full_active_p2",
+                    }
+                )
     return rows
 
 
@@ -292,6 +366,11 @@ def main():
     parser.add_argument("--lr", type=float, default=0.05)
     parser.add_argument("--restarts", type=int, default=4)
     parser.add_argument("--max-component-qubits", type=int, default=24)
+    parser.add_argument("--include-full-active", action="store_true")
+    parser.add_argument("--max-full-qubits", type=int, default=24)
+    parser.add_argument("--run-ids", nargs="*", default=None)
+    parser.add_argument("--top-k", type=int, default=0)
+    parser.add_argument("--n", type=int, default=None)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args()
 
@@ -299,8 +378,35 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     summary_rows = load_summary(args.exploration_dir / "summary.csv")
 
+    if args.run_ids:
+        selected_runs = [(run_id[:24], run_id) for run_id in args.run_ids]
+    elif int(args.top_k) > 0:
+        candidates = [
+            row
+            for row in summary_rows.values()
+            if args.n is None or int(float(row["n"])) == int(args.n)
+        ]
+        candidates = sorted(
+            candidates,
+            key=lambda row: max(
+                float(row.get("best_sample_local_search_ratio") or 0.0),
+                float(row.get("best_round_local_search_ratio") or 0.0),
+                float(row.get("best_expected_ratio") or 0.0),
+            ),
+            reverse=True,
+        )[: int(args.top_k)]
+        selected_runs = [
+            (
+                f"top{index + 1}_n{int(float(row['n']))}",
+                row["run_id"],
+            )
+            for index, row in enumerate(candidates)
+        ]
+    else:
+        selected_runs = list(RUN_IDS.items())
+
     rows = []
-    for label, run_id in RUN_IDS.items():
+    for label, run_id in selected_runs:
         rows.extend(evaluate_run(label, run_id, args, device, summary_rows))
 
     fields = [
@@ -338,12 +444,12 @@ def main():
         "- mode: component-wise p=2 QAOA with independent parameters per residual connected component",
         "- fixed values: `p_i >= 0.5` rounded value; fixed set: `|p_i - 0.5| >= threshold`",
         "",
-        "| run | n | threshold | remaining | isolated | active | max comp | rounded | round+greedy | qaoa init | p2 expected | exact residual |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|",
+        "| run | n | threshold | remaining | isolated | active | max comp | rounded | round+greedy | qaoa init | mode | p2 expected | exact residual |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---:|---:|",
     ]
     for row in rows:
         lines.append(
-            "| {run} | {n} | {threshold:.2f} | {remaining} | {isolated} | {active} | {comp} | {rounded:.6f} | {greedy:.6f} | {init} | {qaoa} | {exact} |".format(
+            "| {run} | {n} | {threshold:.2f} | {remaining} | {isolated} | {active} | {comp} | {rounded:.6f} | {greedy:.6f} | {init} | {note} | {qaoa} | {exact} |".format(
                 run=row["run_label"],
                 n=row["n"],
                 threshold=float(row["threshold"]),
@@ -354,6 +460,7 @@ def main():
                 rounded=float(row["rounded_ratio"]),
                 greedy=float(row["rounded_greedy_ratio"]),
                 init=row["qaoa_init"],
+                note=row["qaoa_note"],
                 qaoa=(
                     f"{float(row['qaoa_p2_expected_ratio']):.6f}"
                     if row["qaoa_p2_expected_ratio"] != ""

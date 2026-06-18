@@ -4751,3 +4751,535 @@ weighted signed graph frustration
    ```
 
    后续如果要写成严格 approximation ratio，需要接入 exact/best-known MaxCut denominator。
+
+### 18.20 15h MaxCut-3 baseline-chasing 目标
+
+用户给出新的硬目标：
+
+```text
+Google / warm-start QAOA baseline:
+  n = 512 量级
+  reported quality target ≈ 0.90-0.96
+
+我们的当前目标:
+  至少达到 0.90+
+  最好超过该 baseline
+```
+
+因此当前探索不再满足于 `0.87-0.89`，而是明确追求：
+
+```text
+MaxCut-3:
+  n = 512 首先冲到 0.90+
+  n = 1024 保持 0.87+ 并继续向 0.90 推进
+```
+
+#### 18.20.1 当前已知最好点
+
+```text
+n = 512:
+  model = V13 random-Z J-regularized SQNN
+  seed = 23
+  strength = 0.05
+  best expected = 0.806886
+  round + 1-bit greedy = 0.876302
+  sample + 1-bit greedy = 0.889323
+
+n = 1024:
+  model = V13 random-Z J-regularized SQNN
+  seed = 17
+  strength = 0.20
+  best expected = 0.835682
+  round + 1-bit greedy = 0.871745
+  sample + 1-bit greedy = 0.875651
+```
+
+距离目标：
+
+```text
+n = 512:
+  还差约 0.0107 到 0.90
+
+n = 1024:
+  还差约 0.0243 到 0.90
+```
+
+#### 18.20.2 当前不偏离中心思想的优化方向
+
+以下方向都仍然围绕：
+
+```text
+V13 SQNN -> MaxCut-3 warm-start -> QAOA / quantum-style readout
+```
+
+不会切换到无关模型。
+
+1. **random-Z strength fine sweep**
+
+   重点不是粗扫 `0.05/0.10/0.20/0.30`，而是在已知好区间附近细扫：
+
+   ```text
+   strength = 0.03 / 0.05 / 0.07 / 0.10 / 0.15 / 0.18 / 0.20 / 0.22 / 0.25
+   graph seed = 17 / 23 / 42 / 101 / 202
+   symmetry_seed 多起点
+   ```
+
+2. **learnable strength multi-start**
+
+   固定扫描更适合找上限，但可学习 strength 能修正坏扰动。因此采用：
+
+   ```text
+   outer loop:
+     init_strength / strength_max / symmetry_seed
+
+   inner loop:
+     raw_symmetry_strength 可训练
+   ```
+
+3. **readout sampling budget escalation**
+
+   之前 `sample + 1-bit greedy` 多数只用了 `num_samples = 128`。距离 0.90 只差一点时，需要测试：
+
+   ```text
+   num_samples = 512 / 1024 / 2048 / 4096 / 8192
+   ```
+
+   目标是判断 SQNN 概率分布里是否已经有 0.90+ 解，只是小样本没有抽到。
+
+4. **trust-region / two-stage tuning**
+
+   当前 `two_stage_fraction = 0.60`、`trust_shrink = 0.25`、`trust_threshold = 1e-4`。下一步扫：
+
+   ```text
+   two_stage_fraction = 0.50 / 0.60 / 0.70 / 0.80
+   trust_shrink = 0.10 / 0.25 / 0.50
+   trust_threshold = 0 / 1e-5 / 1e-4 / 3e-4
+   ```
+
+5. **J penalty / entropy schedule tuning**
+
+   当前可能过早变自信，导致 QAOA residual 被切窄。需要扫：
+
+   ```text
+   j_weight = 50 / 100 / 150 / 200
+   entropy_weight = 0.01 / 0.02 / 0.04
+   final_entropy_weight = 0 / 0.001 / 0.005
+   ```
+
+6. **round readout vs QAOA readout**
+
+   已知 `round fixing + p=2 QAOA` 没超过 1-bit greedy，原因是 fixing 过早锁死变量。因此下一步测：
+
+   ```text
+   conservative threshold = 0.45 / 0.48 / 0.49
+   full active statevector QAOA when active <= 24
+   component-wise QAOA
+   selected uncertain shell QAOA
+   ```
+
+   特别要验证用户提出的疑问：分块优化是否损失了整体效果。对于 active 足够小的 residual，必须同时跑：
+
+   ```text
+   full residual QAOA
+   component-wise independent QAOA
+   ```
+
+7. **classic warm-start + SQNN**
+
+   15h 的 MaxCut-3 主线探索完成后，仿照 Google warm-start 思路做：
+
+   ```text
+   classical warm-start vector
+     -> SQNN initialization / calibration
+     -> V13 J-regularized refinement
+     -> QAOA or quantum-style readout
+   ```
+
+   经典 warm-start 候选：
+
+   ```text
+   spectral relaxation
+   multi-start 1-bit greedy local optimum
+   simulated annealing
+   GW-like SDP relaxation if dependency/time allows
+   ```
+
+#### 18.20.3 15h 循环执行规则
+
+本轮长探索采用循环：
+
+```text
+1. 列举当前最值得优化的方向
+2. 生成一批 MaxCut-3 实验
+3. 运行并记录 summary.csv / report.md / plots
+4. 找出 best expected、best sample+greedy、best QAOA readout
+5. 根据结果调整下一批方向
+6. 继续循环，目标 15h
+```
+
+每一轮都要更新：
+
+```text
+sqnn_qaoa_warmstart_project_plan.md
+outputs/maxcut3_15h_exploration/*
+```
+
+当前成功标准：
+
+```text
+primary:
+  n=512 MaxCut-3 sample/readout quality >= 0.90
+
+secondary:
+  n=1024 MaxCut-3 sample/readout quality >= 0.90
+
+diagnostic:
+  residual QAOA must explain whether quantum-style readout can beat 1-bit greedy
+```
+
+### 18.21 15h 探索启动前的两条快速诊断
+
+在正式长跑前，先做两条快速诊断，避免 15h 浪费在错误方向上。
+
+#### 18.21.1 大样本 SQNN readout
+
+针对当前 `n=512` 最强 binary run：
+
+```text
+run = potential_v13_maxcut3_symmetry_random_regular_maxcut_n512_d3p0_s23_jw100p0_relu_762baf65d2
+```
+
+将 readout 样本数从原来的 `128` 提高：
+
+```text
+num_samples = 512 / 2048 / 8192
+```
+
+结果：
+
+| samples | SQNN sample + 1-bit greedy | random sample + 1-bit greedy |
+|---:|---:|---:|
+| `512` | `0.894531` | `0.877604` |
+| `8192` | `0.894531` | `0.884115` |
+
+判断：
+
+```text
+SQNN distribution 确实比 random readout 强；
+但是单纯增加 samples 没有突破 0.90；
+下一步必须优化模型分布本身，而不是只加采样数。
+```
+
+#### 18.21.2 full-active QAOA vs component-wise QAOA
+
+用户提出疑问：QAOA 不如 1-bit greedy，是否因为我们把小 residual 分块优化，损失了整体效果。
+
+针对 `n=1024` 最强 expected run，加入 full-active statevector p=2 QAOA 对照：
+
+```text
+run = potential_v13_maxcut3_symmetry_random_regular_maxcut_n1024_d3p0_s17_jw100p0_relu_fc674c86e2
+```
+
+结果：
+
+```text
+component-wise p=2 best = 0.866863
+full-active p=2 best    = 0.866322
+round + 1-bit greedy    = 0.871745
+exact residual upper    = 0.867839
+```
+
+判断：
+
+```text
+分块优化不是主要问题；
+component-wise independent parameters 反而更强；
+QAOA 落后主要因为 round fixing 已经锁死了有用变量；
+后续应重点做 conservative fixing / uncertain shell QAOA，而不是简单整体化。
+```
+
+#### 18.21.3 已接入的新工具
+
+```text
+scripts/rescore_maxcut3_readout.py
+  用更大 sampling budget 对已保存 SQNN run 做 readout 重评分；
+  已改成 batch 1-bit greedy，避免逐样本 Python loop。
+
+scripts/run_maxcut3_residual_qaoa_from_exploration.py
+  已支持 --include-full-active；
+  可同时比较 component-wise QAOA 和 full-active QAOA。
+
+scripts/explore_j_regularized_sqnn.py
+  已新增 --maxcut3-baseline-chase；
+  目标是 15h 内循环搜索 0.90+ MaxCut-3 方案。
+```
+
+### 18.22 MaxCut 主线阶段结果：15h 探索 + classical warm-start
+
+本阶段按用户要求先聚焦 MaxCut / MaxCut-3。`noisy planted parity` 和 `weighted signed graph frustration` 仍保留为现实意义扩展路线，但当前不继续占用主线实验预算。
+
+当前主线固定为：
+
+```text
+random regular MaxCut-3
+  -> classical / spectral warm-start
+  -> V13 random-Z J-regularized SQNN refinement
+  -> sampling / 1-bit greedy readout
+  -> residual QAOA diagnostic
+```
+
+这里的 ratio 仍是 cut fraction：
+
+```text
+cut_value / total_edge_weight
+```
+
+对于 random 3-regular MaxCut，这不是严格的 exact optimum approximation ratio。它可以和 warm-start QAOA 文献中的 cut fraction 曲线对齐，但如果要写论文里的严格 approximation ratio，需要额外接入 exact/best-known MaxCut denominator。
+
+#### 18.22.1 15h 无经典预热 V13 探索结果
+
+输出目录：
+
+```text
+outputs/maxcut3_15h_exploration
+```
+
+运行规模：
+
+```text
+completed runs = 194
+elapsed = 15.02 h
+model = V13 random-Z symmetry-breaking J-regularized SQNN
+```
+
+最好结果：
+
+| setting | model route | best expected | best round + 1-bit greedy | best sample + 1-bit greedy |
+|---|---|---:|---:|---:|
+| `n=512, seed=42` | learnable strength, init `0.10`, max `0.50` | `0.826725` | `0.889323` | `0.897135` |
+| `n=512, seed=101` | fixed strength `0.15` | `0.857336` | `0.873698` | `0.877604` |
+| `n=1024, seed=101` | fixed strength `0.05` | `0.795163` | `0.878255` | `0.882812` |
+
+大采样重评分：
+
+```text
+outputs/maxcut3_15h_readout_rescore
+outputs/maxcut3_15h_readout_rescore_deep
+outputs/maxcut3_15h_readout_rescore_n1024
+```
+
+结果：
+
+| setting | SQNN sample + 1-bit greedy | random sample + 1-bit greedy | note |
+|---|---:|---:|---|
+| `n=512, seed=42`, 32768 samples | `0.901042` | `0.889323` | 692 / 768 edges cut |
+| `n=1024, seed=17`, 8192 samples | `0.889323` | `0.865885` | 1366 / 1536 edges cut |
+| `n=1024, seed=101`, 8192 samples | `0.887370` | `0.873047` | large-scale still below 0.90 |
+
+判断：
+
+```text
+1. 单独 V13 SQNN 已经能在 n=512 MaxCut-3 上跨过 0.90；
+2. n=1024 仍稳定低于 0.90，最高约 0.889；
+3. SQNN readout 明显强于 random readout，但无经典预热时，大规模上限仍不够；
+4. 因此必须进入 classical warm-start + SQNN 路线，而不是继续只扫 random-Z strength。
+```
+
+#### 18.22.2 classical warm-start + SQNN 接入
+
+新增代码入口：
+
+```text
+scripts/explore_j_regularized_sqnn.py --maxcut3-warm-start
+scripts/rescore_maxcut3_readout.py --n ...
+```
+
+warm-start 只改初始态，不改 SQNN 主体：
+
+```text
+classical binary assignment x
+  -> confidence c
+  -> p_i = c if x_i = 1 else 1-c
+  -> Bloch initial state:
+       Z_i = 2 p_i - 1
+       X_i = sqrt(1 - Z_i^2)
+```
+
+然后继续使用同一套：
+
+```text
+field_steps[t]
+phase_steps[t]
+mixer_bias[t]
+initial_angles
+J penalty
+two-stage trust-region
+random-Z / learnable symmetry strength
+```
+
+当前接入的 classical warm-start 来源：
+
+```text
+random_batch_greedy:
+  随机生成多批二值解；
+  对每个样本做 1-bit greedy local search；
+  取最好局部最优解作为 SQNN 初态。
+
+spectral_greedy:
+  对图邻接矩阵取最小特征向量；
+  用中位数切分得到二值分区；
+  再做 1-bit greedy local search；
+  作为 SQNN 初态。
+```
+
+需要强调：
+
+```text
+spectral_greedy 不是 SQNN 本体；
+它是仿照 Google warm-start 思路加入的 classical preprocessor。
+实验记录必须同时报告 warm_start_local_search_ratio 和 SQNN 后续 readout ratio，
+这样才能看清 SQNN 是主增益还是微调增益。
+```
+
+#### 18.22.3 classical warm-start probe 结果
+
+输出目录：
+
+```text
+outputs/maxcut3_warm_start_probe
+outputs/maxcut3_warm_start_readout_rescore
+```
+
+最好结果：
+
+| setting | warm-start source | warm-start local ratio | SQNN best expected | SQNN sample + 1-bit greedy | random sample + 1-bit greedy |
+|---|---|---:|---:|---:|---:|
+| `n=512, seed=42` | `spectral_greedy`, confidence `0.55` | `0.923177` | `0.905748` | `0.925781` | `0.891927` |
+| `n=512, seed=42` | `spectral_greedy`, confidence `0.60` | `0.923177` | `0.908174` | `0.925781` | `0.891927` |
+| `n=1024, seed=17` | `spectral_greedy`, confidence `0.55` | `0.911458` | `0.898372` | `0.914062` | `0.869792` |
+| `n=1024, seed=17` | `spectral_greedy`, confidence `0.60` | `0.911458` | `0.883316` | `0.913411` | `0.865885` |
+| `n=512, seed=42` | `random_batch_greedy`, confidence `0.55` | `0.882812` | `0.868744` | `0.898438` | `0.891927` |
+
+判断：
+
+```text
+1. classical warm-start + SQNN 明确超过 0.90：
+   n=512 best = 0.925781
+   n=1024 best = 0.914062
+
+2. spectral_greedy 是当前最强 classical preprocessor：
+   它本身已经把 MaxCut-3 推过 0.90；
+   SQNN refinement 主要提供小幅提升和概率分布 / residual 结构。
+
+3. random_batch_greedy 更能代表不利用谱结构的通用 classical preheat：
+   n=512 从 warm-start 0.882812 提升到 SQNN sample+greedy 0.898438；
+   仍接近 0.90，但不如 spectral_greedy。
+
+4. 后续如果目标是“超过 Google warm-start baseline”，必须诚实区分：
+   pure V13 SQNN result；
+   classical warm-start result；
+   classical warm-start + SQNN incremental gain。
+```
+
+#### 18.22.4 residual QAOA / 整体优化验证
+
+用户提出问题：
+
+```text
+QAOA 接在 residual 后不如 1-bit greedy，
+会不会是因为我们把 residual 分成小连通分量单独优化，
+损失了整体优化效果？
+```
+
+新增验证：
+
+```text
+scripts/run_maxcut3_residual_qaoa_from_exploration.py
+  --top-k
+  --n
+  --include-full-active
+```
+
+验证对象：
+
+```text
+outputs/maxcut3_warm_start_probe top-4
+threshold = 0.20 / 0.25 / 0.30 / 0.35 / 0.40 / 0.45
+p = 2 residual QAOA
+init = SQNN residual probabilities / plus
+mode = componentwise_p2 / full_active_p2
+```
+
+结果摘要：
+
+| case | best componentwise p=2 | best full-active p=2 | exact residual | round + 1-bit greedy |
+|---|---:|---:|---:|---:|
+| `n=512 warm-start top1` | `0.925104` | `0.925079` | `0.925781` | `0.925781` |
+| `n=512 warm-start top2` | `0.923802` | `0.923624` | `0.924479` | `0.923177` |
+| `n=1024 warm-start top` | all fixed / no active residual | - | `0.911458` | `0.911458` |
+
+判断：
+
+```text
+1. 分块 QAOA 不是主要问题；
+2. full-active p=2 并没有超过 componentwise p=2；
+3. p=2 QAOA expected value 仍略低于 exact residual / greedy readout；
+4. warm-start 后 residual 往往已经很小，甚至没有 active residual；
+5. 当前 QAOA 增益路线不应继续只做“整体化”，而应研究：
+   conservative fixing;
+   selected uncertain shell;
+   更高层数或更强 QAOA optimizer;
+   或把 SQNN 输出直接作为 QAOA 初态而不是先过窄固定。
+```
+
+#### 18.22.5 当前要优化的变量清单
+
+主模型仍保持 V13，不加入无关模块。当前可优化变量分三类：
+
+```text
+SQNN trainable parameters:
+  field_steps[t]
+  phase_steps[t]
+  mixer_bias[t]
+  initial_angles
+  raw_symmetry_strength, optional
+
+SQNN hyperparameters:
+  message rounds
+  epochs
+  lr
+  weight_decay
+  j_weight
+  entropy_weight
+  final_entropy_weight
+  trust_shrink
+  trust_threshold
+  two_stage_fraction
+  symmetry_strength
+  symmetry_strength_max
+  symmetry_seed
+
+warm-start / readout variables:
+  warm_start_source
+  warm_start_confidence
+  warm_start_random_samples
+  warm_start_batch_size
+  warm_start_local_search_passes
+  readout num_samples
+  readout 1-bit greedy passes
+  fixing threshold
+  residual QAOA init
+  residual QAOA mode
+  residual QAOA layers / steps / restarts
+```
+
+当前最值得继续优化：
+
+```text
+1. spectral_greedy + SQNN 的多 seed 稳定性；
+2. random_batch_greedy + SQNN 是否能稳定跨 0.90；
+3. warm_start_confidence 是否可以学习，而不是扫描；
+4. SQNN 对 spectral warm-start 的增益能否从 0.2%-0.4% 提高到 1%+；
+5. selected uncertain shell QAOA，避免把 QAOA 空间切得过窄；
+6. 使用更接近 GW / SDP 的 classical preprocessor，和 Google warm-start 做更公平对照。
+```

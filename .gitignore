@@ -17,6 +17,7 @@ htmlcov/
 *.log
 *.tmp
 *.temp
+tmp/
 
 *.pt
 *.pth

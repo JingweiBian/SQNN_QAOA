@@ -32,6 +32,7 @@ from run_qubo_warmstart import make_benchmark, ratio_value  # noqa: E402
 from quantum.core.layers import _apply_bloch_noise, _apply_bloch_rotation  # noqa: E402
 from quantum.warmstart import (  # noqa: E402
     batch_greedy_local_search,
+    best_of_random,
     greedy_local_search,
     residual_qaoa_active_summary,
     sample_bernoulli,
@@ -52,6 +53,13 @@ SUMMARY_FIELDS = [
     "negative_ratio",
     "rounds",
     "epochs",
+    "lr",
+    "weight_decay",
+    "entropy_weight",
+    "final_entropy_weight",
+    "num_samples",
+    "local_search_passes",
+    "sample_local_search_passes",
     "j_weight",
     "penalty",
     "round_weight",
@@ -67,6 +75,13 @@ SUMMARY_FIELDS = [
     "symmetry_strength_trainable",
     "symmetry_strength_max",
     "symmetry_seed",
+    "warm_start_source",
+    "warm_start_confidence",
+    "warm_start_random_samples",
+    "warm_start_batch_size",
+    "warm_start_local_search_passes",
+    "warm_start_ratio",
+    "warm_start_local_search_ratio",
     "softplus_tau",
     "training_seconds",
     "final_symmetry_strength",
@@ -131,6 +146,125 @@ def config_id(config):
     return label.replace(".", "p").replace("-", "m")
 
 
+def spectral_maxcut_assignment(benchmark, device):
+    n = int(benchmark.problem.num_variables)
+    edge_index = benchmark.edge_index.detach().cpu()
+    edge_weight = benchmark.edge_weight.detach().cpu().to(dtype=torch.float32)
+    adjacency = torch.zeros((n, n), dtype=torch.float32)
+    if edge_index.numel():
+        src, dst = edge_index
+        adjacency[src, dst] = edge_weight
+        adjacency[dst, src] = edge_weight
+    eigenvalues, eigenvectors = torch.linalg.eigh(adjacency)
+    vector = eigenvectors[:, int(torch.argmin(eigenvalues).item())]
+    threshold = torch.median(vector)
+    assignment = (vector >= threshold).to(dtype=benchmark.problem.linear.dtype)
+    return assignment.to(device=device)
+
+
+def batch_flip_deltas(problem, assignments):
+    x = assignments.to(dtype=problem.linear.dtype, device=problem.linear.device)
+    influence = problem.linear.unsqueeze(0).expand(x.shape[0], -1).clone()
+    if problem.edge_weight.numel():
+        src, dst = problem.edge_index
+        edge_weight = problem.edge_weight.to(device=x.device, dtype=x.dtype)
+        influence.index_add_(1, src, x[:, dst] * edge_weight.unsqueeze(0))
+        influence.index_add_(1, dst, x[:, src] * edge_weight.unsqueeze(0))
+    return (1.0 - 2.0 * x) * influence
+
+
+def batch_greedy_best(problem, assignments, max_passes):
+    current = assignments.clone().to(dtype=problem.linear.dtype, device=problem.linear.device)
+    energies = problem.energy(current)
+    active_indices = torch.arange(current.shape[0], device=current.device)
+
+    for _ in range(int(max_passes)):
+        deltas = batch_flip_deltas(problem, current)
+        best_delta, best_index = torch.min(deltas, dim=1)
+        improving = best_delta < -1e-12
+        if not bool(improving.any().item()):
+            break
+        rows = active_indices[improving]
+        cols = best_index[improving]
+        current[rows, cols] = 1.0 - current[rows, cols]
+        energies[improving] = energies[improving] + best_delta[improving]
+
+    best_pos = torch.argmin(energies)
+    return current[best_pos], energies[best_pos]
+
+
+def best_random_batch_greedy(problem, num_samples, chunk_size, max_passes, generator):
+    best_assignment = None
+    best_energy = None
+    processed = 0
+    while processed < int(num_samples):
+        count = min(int(chunk_size), int(num_samples) - processed)
+        samples = torch.randint(
+            0,
+            2,
+            (count, problem.num_variables),
+            dtype=problem.linear.dtype,
+            device=problem.linear.device,
+            generator=generator,
+        )
+        assignment, energy = batch_greedy_best(problem, samples, max_passes=max_passes)
+        if best_energy is None or bool((energy < best_energy).detach().item()):
+            best_assignment = assignment
+            best_energy = energy
+        processed += count
+    return best_assignment, best_energy
+
+
+def make_warm_start_probabilities(config, benchmark, problem, device):
+    source = str(config.get("warm_start_source", "none") or "none")
+    confidence = float(config.get("warm_start_confidence", 0.5))
+    if source == "none" or confidence <= 0.5:
+        return None, {
+            "warm_start_ratio": "",
+            "warm_start_local_search_ratio": "",
+        }
+
+    if source == "random_greedy":
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(config["seed"]) + 50021)
+        assignment, _, _ = best_of_random(
+            problem,
+            num_samples=int(config.get("warm_start_random_samples", 2048)),
+            generator=generator,
+        )
+    elif source == "random_batch_greedy":
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(config["seed"]) + 50123)
+        assignment, _ = best_random_batch_greedy(
+            problem,
+            num_samples=int(config.get("warm_start_random_samples", 2048)),
+            chunk_size=int(config.get("warm_start_batch_size", 256)),
+            max_passes=int(config.get("warm_start_local_search_passes", 180)),
+            generator=generator,
+        )
+    elif source == "spectral_greedy":
+        assignment = spectral_maxcut_assignment(benchmark, device=device)
+    else:
+        raise ValueError(f"unknown warm_start_source: {source}")
+
+    best_known = benchmark.known_optimum.to(device=device, dtype=problem.linear.dtype)
+    raw_ratio = objective_ratio(benchmark, assignment, best_known)
+    local_assignment, _, _ = greedy_local_search(
+        problem,
+        assignment,
+        max_passes=int(config.get("warm_start_local_search_passes", 180)),
+    )
+    local_ratio = objective_ratio(benchmark, local_assignment, best_known)
+    confidence = min(max(confidence, 0.500001), 0.999999)
+    high = torch.as_tensor(confidence, device=device, dtype=problem.linear.dtype)
+    low = torch.as_tensor(1.0 - confidence, device=device, dtype=problem.linear.dtype)
+    probabilities = torch.where(local_assignment > 0.5, high, low)
+    return probabilities, {
+        "warm_start_ratio": float(raw_ratio),
+        "warm_start_local_search_ratio": float(local_ratio),
+    }
+
+
 class JRegularizedSyncLocalSQNN(nn.Module):
     def __init__(
         self,
@@ -153,6 +287,7 @@ class JRegularizedSyncLocalSQNN(nn.Module):
         symmetry_strength_trainable=False,
         symmetry_strength_max=0.5,
         symmetry_seed=0,
+        initial_probabilities=None,
     ):
         super().__init__()
         self.num_variables = int(num_variables)
@@ -170,6 +305,13 @@ class JRegularizedSyncLocalSQNN(nn.Module):
         self.symmetry_strength_trainable = bool(symmetry_strength_trainable)
         self.symmetry_strength_max = float(symmetry_strength_max)
         self.symmetry_seed = int(symmetry_seed)
+        if initial_probabilities is None:
+            initial_probabilities = torch.empty(0)
+        self.register_buffer(
+            "initial_probabilities",
+            torch.as_tensor(initial_probabilities, dtype=torch.get_default_dtype()).detach().clone(),
+            persistent=False,
+        )
         self.field_steps = nn.Parameter(torch.full((self.message_rounds,), float(step_init)))
         self.phase_steps = nn.Parameter(torch.full((self.message_rounds,), float(phase_init)))
         self.mixer_bias = nn.Parameter(torch.full((self.message_rounds,), float(mixer_bias_init)))
@@ -199,7 +341,13 @@ class JRegularizedSyncLocalSQNN(nn.Module):
 
     def _initial_bloch(self, problem):
         bloch = torch.zeros((problem.num_variables, 3), dtype=self.dtype, device=self.device)
-        bloch[:, 0] = 1.0
+        if self.initial_probabilities.numel() == problem.num_variables:
+            initial = self.initial_probabilities.to(device=self.device, dtype=self.dtype).clamp(1e-6, 1.0 - 1e-6)
+            z_value = 2.0 * initial - 1.0
+            bloch[:, 0] = torch.sqrt((1.0 - z_value * z_value).clamp_min(0.0))
+            bloch[:, 2] = z_value
+        else:
+            bloch[:, 0] = 1.0
         angles = self.initial_angles.to(dtype=self.dtype, device=self.device).expand(
             problem.num_variables,
             -1,
@@ -647,7 +795,7 @@ def rewrite_summary(path, rows):
         writer = csv.DictWriter(file_obj, fieldnames=SUMMARY_FIELDS)
         writer.writeheader()
         for row in rows:
-            writer.writerow(row)
+            writer.writerow({field: row.get(field, "") for field in SUMMARY_FIELDS})
 
 
 def load_summary(path):
@@ -677,6 +825,12 @@ def train_one(config, device, output_dir):
     benchmark.edge_weight = benchmark.edge_weight.to(device=device, dtype=benchmark.problem.linear.dtype)
     best_known = benchmark.known_optimum.to(device=device, dtype=benchmark.problem.linear.dtype)
     problem = benchmark.problem
+    warm_start_probabilities, warm_start_stats = make_warm_start_probabilities(
+        config,
+        benchmark,
+        problem,
+        device,
+    )
 
     model = JRegularizedSyncLocalSQNN(
         num_variables=problem.num_variables,
@@ -692,6 +846,7 @@ def train_one(config, device, output_dir):
         symmetry_strength_trainable=bool(config.get("symmetry_strength_trainable", False)),
         symmetry_strength_max=float(config.get("symmetry_strength_max", 0.5)),
         symmetry_seed=int(config.get("symmetry_seed", config["seed"])),
+        initial_probabilities=warm_start_probabilities,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -755,6 +910,7 @@ def train_one(config, device, output_dir):
             "run_id": run_id,
             "training_seconds": float(training_seconds),
             "final_symmetry_strength": float(model.current_symmetry_strength().detach().cpu()),
+            **warm_start_stats,
             **quality,
         }
     )
@@ -816,6 +972,11 @@ def base_config():
         "symmetry_strength_trainable": False,
         "symmetry_strength_max": 0.5,
         "symmetry_seed": 0,
+        "warm_start_source": "none",
+        "warm_start_confidence": 0.5,
+        "warm_start_random_samples": 2048,
+        "warm_start_batch_size": 256,
+        "warm_start_local_search_passes": 180,
         "softplus_tau": 1e-3,
         "lr": 3e-3,
         "weight_decay": 1e-4,
@@ -1379,6 +1540,270 @@ def build_maxcut3_strength_learn_queue():
     return queue
 
 
+def build_maxcut3_baseline_chase_queue():
+    """Long MaxCut-3 queue aimed at finding 0.90+ readout quality."""
+
+    base = with_updates(
+        base_config(),
+        phase="maxcut3_baseline_chase",
+        benchmark="random_regular_maxcut",
+        average_degree=3.0,
+        noise_rate=0.10,
+        negative_ratio=1.0,
+        j_weight=100.0,
+        penalty="relu",
+        round_weight="flat",
+        trust_mode="two_stage",
+        trust_shrink=0.25,
+        trust_threshold=1e-4,
+        two_stage_fraction=0.60,
+        symmetry_breaking="random_z",
+        symmetry_strength_trainable=False,
+        entropy_weight=0.02,
+        final_entropy_weight=0.001,
+        num_samples=512,
+        local_search_passes=180,
+        sample_local_search_passes=100,
+        log_every=10,
+    )
+
+    def size_config(config, n):
+        return with_updates(
+            config,
+            n=n,
+            rounds=280 if int(n) == 512 else 380,
+            epochs=110 if int(n) == 512 else 130,
+            num_samples=768 if int(n) == 512 else 384,
+        )
+
+    queue = []
+
+    # First pass: fine strength sweep around the best fixed-strength region.
+    for n in [512, 1024]:
+        seeds = [23, 17, 42, 101, 202] if n == 512 else [17, 23, 42, 101, 202]
+        strengths = [0.05, 0.07, 0.10, 0.15, 0.18, 0.20, 0.22, 0.25, 0.03]
+        for seed in seeds:
+            for strength in strengths:
+                for symmetry_trial in [0, 1]:
+                    symmetry_seed = (
+                        8100
+                        + int(n)
+                        + int(seed) * 13
+                        + int(1000 * strength)
+                        + 97 * symmetry_trial
+                    )
+                    queue.append(
+                        size_config(
+                            with_updates(
+                                base,
+                                phase="maxcut3_strength_fine",
+                                seed=seed,
+                                symmetry_strength=strength,
+                                symmetry_seed=symmetry_seed,
+                            ),
+                            n,
+                        )
+                    )
+
+    # Second pass: keep the same idea but let strength self-calibrate.
+    for n in [512, 1024]:
+        seeds = [23, 17, 42, 101] if n == 512 else [17, 23, 42, 101]
+        for seed in seeds:
+            for init_strength in [0.05, 0.10, 0.15, 0.20, 0.25]:
+                for max_strength in [0.30, 0.50]:
+                    symmetry_seed = (
+                        9100
+                        + int(n)
+                        + int(seed) * 17
+                        + int(1000 * init_strength)
+                        + int(100 * max_strength)
+                    )
+                    queue.append(
+                        size_config(
+                            with_updates(
+                                base,
+                                phase="maxcut3_learn_strength_chase",
+                                seed=seed,
+                                symmetry_strength=init_strength,
+                                symmetry_strength_trainable=True,
+                                symmetry_strength_max=max_strength,
+                                symmetry_seed=symmetry_seed,
+                            ),
+                            n,
+                        )
+                    )
+
+    # Third pass: tune the objective pressure around known good strengths.
+    for n in [512, 1024]:
+        seeds = [23, 17, 42] if n == 512 else [17, 23, 42]
+        good_strengths = [0.05, 0.10, 0.18, 0.20, 0.22]
+        for seed in seeds:
+            for strength in good_strengths:
+                for j_weight in [50.0, 100.0, 150.0, 200.0]:
+                    queue.append(
+                        size_config(
+                            with_updates(
+                                base,
+                                phase="maxcut3_j_weight_chase",
+                                seed=seed,
+                                j_weight=j_weight,
+                                symmetry_strength=strength,
+                                symmetry_seed=10100
+                                + int(n)
+                                + int(seed) * 19
+                                + int(1000 * strength)
+                                + int(j_weight),
+                            ),
+                            n,
+                        )
+                    )
+                for entropy_weight, final_entropy in [(0.01, 0.0), (0.02, 0.001), (0.04, 0.005)]:
+                    queue.append(
+                        size_config(
+                            with_updates(
+                                base,
+                                phase="maxcut3_entropy_chase",
+                                seed=seed,
+                                entropy_weight=entropy_weight,
+                                final_entropy_weight=final_entropy,
+                                symmetry_strength=strength,
+                                symmetry_seed=11100
+                                + int(n)
+                                + int(seed) * 23
+                                + int(1000 * strength)
+                                + int(10000 * entropy_weight),
+                            ),
+                            n,
+                        )
+                    )
+
+    # Fourth pass: trust-region schedule variants.
+    for n in [512, 1024]:
+        seeds = [23, 17, 42] if n == 512 else [17, 23, 42]
+        good_strengths = [0.05, 0.18, 0.20, 0.22]
+        for seed in seeds:
+            for strength in good_strengths:
+                for two_stage_fraction in [0.50, 0.60, 0.70, 0.80]:
+                    for trust_shrink in [0.10, 0.25, 0.50]:
+                        queue.append(
+                            size_config(
+                                with_updates(
+                                    base,
+                                    phase="maxcut3_trust_chase",
+                                    seed=seed,
+                                    two_stage_fraction=two_stage_fraction,
+                                    trust_shrink=trust_shrink,
+                                    trust_threshold=1e-4,
+                                    symmetry_strength=strength,
+                                    symmetry_seed=12100
+                                    + int(n)
+                                    + int(seed) * 29
+                                    + int(1000 * strength)
+                                    + int(100 * two_stage_fraction)
+                                    + int(100 * trust_shrink),
+                                ),
+                                n,
+                            )
+                        )
+
+    # Prioritize n=512 hit-rate early, but keep n=1024 interleaved.
+    n512 = [item for item in queue if int(item["n"]) == 512]
+    n1024 = [item for item in queue if int(item["n"]) == 1024]
+    balanced = []
+    while n512 or n1024:
+        for _ in range(2):
+            if n512:
+                balanced.append(n512.pop(0))
+        if n1024:
+            balanced.append(n1024.pop(0))
+    return balanced
+
+
+def build_maxcut3_warm_start_queue():
+    """Classical warm-start plus the same V13 J-regularized SQNN core."""
+
+    base = with_updates(
+        base_config(),
+        phase="maxcut3_warm_start",
+        benchmark="random_regular_maxcut",
+        average_degree=3.0,
+        noise_rate=0.10,
+        negative_ratio=1.0,
+        j_weight=100.0,
+        penalty="relu",
+        round_weight="flat",
+        trust_mode="two_stage",
+        trust_shrink=0.25,
+        trust_threshold=1e-4,
+        two_stage_fraction=0.60,
+        symmetry_breaking="random_z",
+        entropy_weight=0.02,
+        final_entropy_weight=0.001,
+        local_search_passes=220,
+        sample_local_search_passes=140,
+        warm_start_random_samples=4096,
+        warm_start_batch_size=512,
+        warm_start_local_search_passes=240,
+        log_every=10,
+    )
+
+    def size_config(config, n):
+        return with_updates(
+            config,
+            n=n,
+            rounds=260 if int(n) == 512 else 360,
+            epochs=95 if int(n) == 512 else 115,
+            num_samples=1024 if int(n) == 512 else 512,
+        )
+
+    anchors = [
+        (512, 42, 0.10, True, 0.50),
+        (512, 101, 0.10, True, 0.30),
+        (512, 101, 0.07, False, 0.50),
+        (512, 17, 0.10, False, 0.50),
+        (1024, 17, 0.03, False, 0.50),
+        (1024, 101, 0.05, False, 0.50),
+        (1024, 42, 0.20, False, 0.50),
+        (1024, 23, 0.18, False, 0.50),
+    ]
+    sources = ["random_batch_greedy", "spectral_greedy"]
+    confidences = [0.55, 0.60, 0.65, 0.70]
+    queue = []
+    for n, seed, strength, trainable, max_strength in anchors:
+        for source in sources:
+            for confidence in confidences:
+                queue.append(
+                    size_config(
+                        with_updates(
+                            base,
+                            phase="maxcut3_classical_warm_start",
+                            seed=seed,
+                            symmetry_strength=strength,
+                            symmetry_strength_trainable=trainable,
+                            symmetry_strength_max=max_strength,
+                            symmetry_seed=13100
+                            + int(n)
+                            + int(seed) * 31
+                            + int(1000 * strength)
+                            + int(100 * confidence),
+                            warm_start_source=source,
+                            warm_start_confidence=confidence,
+                        ),
+                        n,
+                    )
+                )
+
+    n512 = [item for item in queue if int(item["n"]) == 512]
+    n1024 = [item for item in queue if int(item["n"]) == 1024]
+    balanced = []
+    while n512 or n1024:
+        if n512:
+            balanced.append(n512.pop(0))
+        if n1024:
+            balanced.append(n1024.pop(0))
+    return balanced
+
+
 def adaptive_configs(summary_rows, start_index=0):
     if not summary_rows:
         return []
@@ -1459,6 +1884,8 @@ def main():
     parser.add_argument("--realistic-roadmap", action="store_true")
     parser.add_argument("--potential-probe", action="store_true")
     parser.add_argument("--maxcut3-strength-learn", action="store_true")
+    parser.add_argument("--maxcut3-baseline-chase", action="store_true")
+    parser.add_argument("--maxcut3-warm-start", action="store_true")
     args = parser.parse_args()
 
     if args.device == "cuda" and not torch.cuda.is_available():
@@ -1483,6 +1910,10 @@ def main():
         queue = build_potential_probe_queue()
     elif args.maxcut3_strength_learn:
         queue = build_maxcut3_strength_learn_queue()
+    elif args.maxcut3_baseline_chase:
+        queue = build_maxcut3_baseline_chase_queue()
+    elif args.maxcut3_warm_start:
+        queue = build_maxcut3_warm_start_queue()
     else:
         queue = build_core_queue()
 

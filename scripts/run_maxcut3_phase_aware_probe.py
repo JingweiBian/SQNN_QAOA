@@ -859,9 +859,9 @@ def build_variants(base, rounds, epochs):
     common = with_updates(
         base,
         benchmark="random_regular_maxcut",
-        n=512,
-        average_degree=3.0,
-        seed=42,
+        n=int(base.get("n", 512)),
+        average_degree=float(base.get("average_degree", 3.0)),
+        seed=int(base.get("seed", 42)),
         rounds=int(rounds),
         epochs=int(epochs),
         num_samples=256,
@@ -1548,6 +1548,9 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--rounds", type=int, default=180)
     parser.add_argument("--epochs", type=int, default=70)
+    parser.add_argument("--n", type=int, default=0)
+    parser.add_argument("--average-degree", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--only-phase", action="append", default=[])
     parser.add_argument("--max-runs", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
@@ -1559,6 +1562,13 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     base = load_base_config(args.source_dir, args.base_run_id)
+    if args.n:
+        base["n"] = int(args.n)
+    if args.average_degree:
+        base["average_degree"] = float(args.average_degree)
+    if args.seed is not None:
+        base["seed"] = int(args.seed)
+        base["symmetry_seed"] = int(args.seed) * 249 + 18
     variants = build_variants(base, args.rounds, args.epochs)
     if args.only_phase:
         wanted = set(args.only_phase)

@@ -7655,3 +7655,66 @@ second-stage SQNN 是有价值的 direct-readout 修复机制，
 2. 对 residual 使用更长 epoch / 更低 lr 的稳定训练；
 3. 不固定所有高置信变量，而是按 edge boundary risk 选择固定集合。
 ```
+
+#### 18.29.12 多 seed 稳定性探针
+
+为了避免只优化 seed=42，本轮加入命令行覆盖：
+
+```text
+scripts/run_maxcut3_phase_aware_probe.py
+  --seed
+  --n
+  --average-degree
+```
+
+并修复 `build_variants` 中原先硬编码 `seed=42` 的问题。之后测试同一个主线配置：
+
+```text
+phase = v14_memory_xy_z_edge_gain14_collapse
+n = 512
+random 3-regular MaxCut
+rounds = 260
+epochs = 115
+```
+
+输出位置：
+
+```text
+outputs/maxcut3_v14_z_edge_gain14_seed_probe_v2/
+outputs/maxcut3_v14_seed_stability_gain14/
+```
+
+结果：
+
+```text
+seed=7:
+  direct + 1-bit greedy C/W = 0.872396
+  sample + 1-bit greedy C/W = 0.876302
+
+seed=23:
+  direct + 1-bit greedy C/W = 0.881510
+  sample + 1-bit greedy C/W = 0.885417
+
+seed=42:
+  direct + 1-bit greedy C/W = 0.901042
+  sample + 1-bit greedy C/W = 0.903646
+
+seed=99:
+  direct + 1-bit greedy C/W = 0.893229
+  sample + 1-bit greedy C/W = 0.897135
+
+4-seed direct mean C/W = 0.887044
+4-seed sample mean C/W = 0.890625
+```
+
+关键判断：
+
+```text
+1. seed=42 的 direct 0.901042 是真实突破，但不是跨 seed 稳定表现。
+2. 目前模型主线具备潜力，但还没有达到“随机 3-regular MaxCut 稳定接近 GW”的标准。
+3. 下一阶段优先级应从单 seed 提升转向跨实例稳定：
+   - adaptive gain / per-instance calibration；
+   - 多 symmetry restarts；
+   - 用 early diagnostics 自动选择 gain；
+   - 对 seed=7/23 这类失败实例做 failure-mode analysis。
+```

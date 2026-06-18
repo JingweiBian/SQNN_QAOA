@@ -5283,3 +5283,1318 @@ warm-start / readout variables:
 5. selected uncertain shell QAOA，避免把 QAOA 空间切得过窄；
 6. 使用更接近 GW / SDP 的 classical preprocessor，和 Google warm-start 做更公平对照。
 ```
+
+补充决定：
+
+```text
+不采用新增 deterministic rounding surrogate loss；
+不在主 loss L 中加入 teacher / rounding alignment / sharpened rounding energy 项；
+当前保持 V13 的 loss 干净：
+  expected energy + entropy schedule + J penalty
+```
+
+原因：
+
+```text
+1. teacher 指导不成立，因为当前任务不是蒸馏，也没有外部可靠 teacher；
+2. rounding surrogate 会让 L 的物理含义变混杂；
+3. direct rounding 改进应优先从 readout calibration、deterministic postprocess、
+   J penalty round weighting、trust-region 参数这些不改变主 loss 形式的方向探索。
+```
+
+### 18.23 长时间探索任务的执行规范
+
+用户纠正：此前把“运行至少 8h / 15h 探索”理解成执行一个长时间脚本，这是不准确的。
+
+以后凡是用户要求：
+
+```text
+连续探索 N 小时；
+不断改进模型；
+不断测试潜力；
+长时间寻找更好方案；
+```
+
+默认含义不是“启动一个单独跑满 N 小时的脚本”，而是：
+
+```text
+在 N 小时研究窗口内，反复进行多轮研究循环。
+```
+
+每一轮应包含：
+
+```text
+1. 根据当前结果提出新的模型改进假设；
+2. 设计一组尽量小而有效的实验验证该假设；
+3. 运行几分钟到几小时的实验；
+4. 立刻分析实验结果；
+5. 判断该方向是继续、缩小、放弃，还是转向；
+6. 把结果、解释、下一步判断写入计划书和实验记录；
+7. 再提出下一轮改进意见并继续实验。
+```
+
+因此，长时间探索任务的正确执行方式是：
+
+```text
+idea -> experiment -> result -> analysis -> next idea -> next experiment
+```
+
+而不是：
+
+```text
+write one large queue -> run unattended for all hours -> end.
+```
+
+执行细则：
+
+1. **实验时长要自适应。**
+
+   如果一个假设可以用 smoke / probe 在几分钟内验证，就先短跑；只有短跑显示有希望，才扩展到更长实验。
+
+2. **每轮都要有解释。**
+
+   不只记录数值，还要说明这些数值支持或反驳了哪个模型判断。
+
+3. **每轮都要更新路线。**
+
+   如果结果不好，应及时改变变量、结构或 readout 策略，而不是机械跑完预设队列。
+
+4. **长脚本只能作为工具，不是探索本身。**
+
+   可以在某一轮里使用长脚本，但必须有明确目的、检查点、输出记录和下一步决策。
+
+5. **计划书必须持续更新。**
+
+   每一轮探索后，都要把以下内容写入计划书：
+
+   ```text
+   hypothesis
+   experiment setting
+   result
+   interpretation
+   next decision
+   ```
+
+6. **模型路线要保持干净。**
+
+   长时间探索可以尝试多个方向，但每个方向必须标注清楚，不把 unrelated trick 混进主模型。
+
+7. **未来默认规则。**
+
+   除非用户明确说“启动一个脚本连续跑满 N 小时”，否则以后所有“N 小时探索”都按上述多轮研究循环执行。
+
+### 18.24 纯 V13 direct rounding + 1-bit greedy 提升尝试
+
+用户要求：当前先关注纯 V13，不使用 Bernoulli sampling，目标是把
+
+```text
+direct rounding + 1-bit greedy
+```
+
+从当前最好约 `0.889323` 提到 `0.90+`。
+
+本节明确删除以下建议：
+
+```text
+不采用 teacher guidance；
+不采用新增 deterministic rounding loss；
+不采用 sharpened rounding surrogate loss；
+不修改主 loss L 的形式。
+```
+
+当前保持 V13 loss：
+
+```text
+L = normalized expected energy
+    - entropy_weight * entropy
+    + j_weight * ReLU(-J)
+```
+
+#### 18.24.1 测试过的非 L 改动方向
+
+本轮只探索不改变主 loss 结构的方案：
+
+```text
+A. readout threshold sweep
+   x_i = 1 if p_i >= tau else 0
+   tau = 0.40 ... 0.60
+
+B. deterministic multi-start
+   不用 Bernoulli sample；
+   从不同 threshold、低置信变量翻转、uncertain shell 产生确定性候选。
+
+C. SQNN-aware deterministic greedy
+   greedy 仍只接受能量下降翻转；
+   当多个翻转接近时，优先低置信变量。
+
+D. J penalty round weighting
+   round_weight = linear_up / sqrt_up / late_half
+
+E. trust-region 参数
+   trust_threshold = 3e-4 / 5e-4
+   trust_shrink = 0.10 / 0.50
+
+F. entropy schedule
+   entropy_weight lower / higher
+
+G. training budget
+   more rounds / more epochs
+
+H. fixed final symmetry strength
+   把 learnable strength 最终值约 0.085 固定重训。
+```
+
+新增工具：
+
+```text
+scripts/evaluate_maxcut3_deterministic_readout.py
+  对保存的 pure V13 run 做 deterministic readout 评估；
+  支持 threshold sweep、低置信翻转、uncertain shell、SQNN-aware greedy。
+
+scripts/run_maxcut3_pure_v13_deterministic_probe.py
+  从当前 n=512 最强 pure V13 run 出发；
+  运行不改变 L 的 targeted training variants。
+```
+
+输出目录：
+
+```text
+outputs/maxcut3_deterministic_readout_probe_best512
+outputs/maxcut3_deterministic_readout_probe_best512_allrounds_small
+outputs/maxcut3_deterministic_readout_probe_top12_512
+outputs/maxcut3_pure_v13_deterministic_probe
+outputs/maxcut3_pure_v13_deterministic_probe_readout_eval
+outputs/maxcut3_deterministic_readout_shell_best512
+outputs/maxcut3_pure_v13_deterministic_probe_shell_eval
+```
+
+#### 18.24.2 结果摘要
+
+基线：
+
+| setting | ratio |
+|---|---:|
+| direct rounding only | `0.859375` |
+| direct rounding + 1-bit greedy | `0.889323` |
+| Bernoulli sample + 1-bit greedy | `0.897135` |
+| large-sample + 1-bit greedy | `0.901042` |
+
+readout-only 结果：
+
+| experiment | best ratio | note |
+|---|---:|---|
+| 当前最强 run，候选轮次 + threshold / low-confidence / SQNN-aware greedy | `0.893229` | 最好 `tau=0.44` |
+| 当前最强 run，所有轮次 + threshold sweep | `0.895833` | 最好 round `249`, `tau=0.42` |
+| n=512 top-12 pure V13 runs + deterministic readout | `0.893229` | 没超过当前最强 run |
+| uncertain shell on 当前最强 run | `0.893229` | shell 没带来额外增益 |
+
+targeted training variants 结果：
+
+| variant | best round + 1-bit greedy | sample + 1-bit greedy | note |
+|---|---:|---:|---|
+| entropy lower: `0.01 -> 0.0` | `0.894531` | `0.897135` | 训练变体中最好 |
+| more epochs | `0.891927` | `0.895833` | 小幅正向 |
+| trust_shrink `0.10` | `0.890625` | `0.897135` | 对 sample 有帮助，对 direct 不够 |
+| trust_threshold `5e-4` | `0.890625` | `0.897135` | 对 direct 不够 |
+| late_half J weighting | `0.889323` | `0.897135` | sample 持平，direct 没提升 |
+| fixed strength `0.085` | `0.846354` | `0.765625` | 明显失败，说明 strength 仍需可学习或多起点 |
+
+targeted variants + deterministic readout calibration：
+
+| experiment | best ratio | note |
+|---|---:|---|
+| 12 个新训练变体 + threshold / low-confidence / SQNN-aware greedy | `0.895833` | 最好仍为 entropy lower + `tau=0.44` |
+| 12 个新训练变体 + uncertain shell | `0.895833` | shell 没进一步提升 |
+
+#### 18.24.3 当前判断
+
+```text
+1. 不改 L 的 deterministic readout 目前最高到 0.895833；
+   距离 0.90 还差约 3 条 cut edge。
+
+2. threshold sweep 有效，但增益有限：
+   0.889323 -> 0.893229 / 0.895833。
+
+3. SQNN-aware greedy tie-break 没有独立贡献；
+   最好结果仍由普通 steepest 1-bit greedy 得到。
+
+4. uncertain shell 没有独立贡献；
+   当前错误不是只靠最低置信少量变量枚举就能修掉。
+
+5. lower entropy schedule 是目前最有希望的训练方向；
+   它让 direct greedy 从 0.889323 提到 0.894531，
+   再配合 threshold 到 0.895833。
+
+6. late J weighting / trust loosen / more rounds / more epochs 都没有把 direct greedy 推到 0.90。
+
+7. fixed final strength 失败，说明 learnable strength 的训练路径很重要；
+   不能简单把最终 strength 数值拿出来固定重跑。
+```
+
+#### 18.24.4 下一步建议
+
+如果仍坚持“不改 L、不用 sampling、不用 classical warm-start”，下一步最值得做：
+
+```text
+1. 围绕 entropy lower 继续细扫：
+   entropy_weight = 0.004 / 0.006 / 0.008 / 0.010 / 0.012
+   final_entropy_weight = 0 / 1e-4 / 5e-4
+
+2. entropy lower + learnable strength 多 seed：
+   seed = 42 当前有效，但需要 symmetry_seed 多起点；
+   目标是找到 deterministic basin，而不是 sample basin。
+
+3. readout threshold 变成实验报告的一部分：
+   固定 tau=0.44 或在 validation seed 上选 tau；
+   不再默认 tau=0.5 一定最优。
+
+4. 尝试 deterministic beam local search：
+   仍不随机；
+   但保留 top-B 个 deterministic greedy path；
+   比单路径 1-bit greedy 更强，且比 Bernoulli sampling 更可解释。
+```
+
+### 18.25 MaxCut-3 RZ/XY 相位积累路线探索
+
+本节回应新的判断：
+
+```text
+RZ 带来的 XY 方向相位积累，可能是 SQNN 改善概率分布的关键方向。
+目标不是再调 readout threshold，而是让模型本身输出更好的概率分布。
+```
+
+本轮保持任务聚焦：
+
+```text
+任务：random_regular_maxcut / MaxCut-3
+n = 512
+seed = 42
+核心读出指标：direct rounding + 1-bit greedy
+辅助指标：expected ratio、sample + 1-bit greedy、Bloch vector cut ratio、final XY radius
+```
+
+新增工具：
+
+```text
+scripts/run_maxcut3_phase_aware_probe.py
+  在 V13 J-regularized SQNN 基础上，探索 RZ/XY 相位相关动力学。
+  保持主路线干净，不引入 teacher，不引入 deterministic rounding loss。
+
+scripts/plot_maxcut3_phase_aware_probe.py
+  汇总短筛选和完整候选复核，生成图和 markdown 报告。
+```
+
+输出目录：
+
+```text
+outputs/maxcut3_phase_aware_probe_short
+outputs/maxcut3_phase_aware_probe
+outputs/maxcut3_phase_aware_report
+```
+
+报告和图：
+
+```text
+outputs/maxcut3_phase_aware_report/phase_aware_probe_report.md
+outputs/maxcut3_phase_aware_report/01_short_phase_screen.png
+outputs/maxcut3_phase_aware_report/02_full_candidate_comparison.png
+outputs/maxcut3_phase_aware_report/03_vector_vs_probability.png
+```
+
+#### 18.25.1 路线定义
+
+本轮逐条探索了以下路线：
+
+| route | 含义 |
+|---|---|
+| baseline RY | 现有 V13 式随机 RY 破对称，作为对照 |
+| RZ only | 只在初始态加入真正的 RZ/XY 相位破对称 |
+| RZ+RY init | 同时加入 RZ 相位破对称和少量 RY 概率破对称 |
+| RZ memory | RZ 角度不只看当前 local field，而是看 local field 的时间记忆 |
+| XY feedback | 把当前 Bloch 向量的 XY 相位反馈进下一轮 RZ 角 |
+| memory+XY | local field 记忆 + XY 相位反馈 |
+| double RZ | 每轮使用 RZ-RY-RZ，让 RY 后的 XY 相位继续影响下一轮 |
+| node gate | 节点级 learnable step gate，让不同变量有不同有效步长 |
+| vector mix | 在概率能量外混入 Bloch vector cut 目标，模拟 GW 向量松弛的方向 |
+
+一个重要修正：
+
+```text
+原代码中 symmetry_breaking="random_z" 的命名容易误导。
+它实际主要加在 Euler angle 的 theta / RY 方向上，
+因此它会直接打破 Z 概率对称，而不是真正只做 RZ 相位破对称。
+
+本轮单独加入 random_rz，专门测试真正的 XY 相位破对称。
+```
+
+#### 18.25.2 短筛选结果
+
+短筛选配置：
+
+```text
+rounds = 80
+epochs = 20
+9 条路线全部跑一遍
+```
+
+| route | expected | round + 1-bit greedy | sample + 1-bit greedy | vector | final XY radius |
+|---|---:|---:|---:|---:|---:|
+| baseline RY | `0.753134` | `0.888021` | `0.897135` | `0.631337` | `0.535368` |
+| RZ only | `0.500000` | `0.783854` | `0.770833` | `0.001755` | `1.000000` |
+| RZ+RY init | `0.754991` | `0.888021` | `0.897135` | `0.637115` | `0.530556` |
+| RZ memory | `0.709230` | `0.888021` | `0.894531` | `0.705086` | `0.660216` |
+| XY feedback | `0.500000` | `0.783854` | `0.770833` | `0.502527` | `1.000000` |
+| memory+XY | `0.715954` | `0.888021` | `0.897135` | `0.709234` | `0.649141` |
+| double RZ | `0.758534` | `0.888021` | `0.897135` | `0.637838` | `0.515391` |
+| node gate | `0.762342` | `0.889323` | `0.894531` | `0.680028` | `0.497524` |
+| vector mix | `0.765207` | `0.888021` | `0.897135` | `0.682926` | `0.505375` |
+
+短筛选判断：
+
+```text
+1. RZ only 失败，不是因为 RZ 没意义，而是因为它不能单独启动 MaxCut-3。
+2. node gate 在短训中 direct greedy 最好，达到 0.889323。
+3. RZ memory / memory+XY 的 vector ratio 明显更高，说明 XY 相位确实在积累结构；
+   但短训阶段还没有充分转成 Z 概率质量。
+4. vector mix 提高 expected/vector 结构，但短训 direct greedy 没超过 node gate。
+```
+
+#### 18.25.3 为什么纯 RZ 会卡住
+
+对 3-regular MaxCut，若所有概率都是：
+
+```text
+p_i = 0.5
+```
+
+则每个节点的 QUBO local field 近似为：
+
+```text
+linear_i + sum_j edge_ij * p_j
+= -degree_i + 2 * degree_i * 0.5
+= 0
+```
+
+而 RZ 只在 Bloch 球的 XY 平面旋转：
+
+```text
+RZ: (X, Y, Z) -> (X', Y', Z)
+```
+
+它不直接改变 Z，因此不改变：
+
+```text
+p_i = (1 - Z_i) / 2
+```
+
+所以纯 RZ 初始相位虽然让 XY 方向不同，但 local field 仍为 0，后续 RY 没有有效驱动力，概率分布无法启动。
+
+结论：
+
+```text
+RZ 必须和 RY 概率破对称、相位记忆、双 RZ、节点步长门控或向量目标耦合。
+纯 RZ 不是可用路线。
+```
+
+#### 18.25.4 完整候选复核
+
+完整复核配置：
+
+```text
+rounds = 280
+epochs = 110
+复核 baseline、memory+XY、double RZ、node gate、vector mix
+```
+
+| route | expected | round + 1-bit greedy | sample + 1-bit greedy | vector | final XY radius |
+|---|---:|---:|---:|---:|---:|
+| baseline RY | `0.811755` | `0.881510` | `0.899740` | `0.745482` | `0.323274` |
+| memory+XY | `0.875292` | `0.893229` | `0.895833` | `0.879184` | `0.068836` |
+| double RZ | `0.785008` | `0.891927` | `0.897135` | `0.684179` | `0.422122` |
+| node gate | `0.814075` | `0.890625` | `0.895833` | `0.760888` | `0.309770` |
+| vector mix | `0.839067` | `0.890625` | `0.895833` | `0.847257` | `0.177723` |
+
+完整复核判断：
+
+```text
+1. memory+XY 是目前最重要的新路线。
+   expected ratio: 0.811755 -> 0.875292
+   direct rounding + 1-bit greedy: 0.881510 -> 0.893229
+   vector ratio: 0.745482 -> 0.879184
+
+2. double RZ 有正向作用：
+   direct greedy = 0.891927，
+   比 baseline 高，但低于 memory+XY。
+
+3. node gate 有正向作用：
+   direct greedy = 0.890625，
+   说明节点级步长确实能帮助概率分布，但单独不够。
+
+4. vector mix 提升 expected/vector，但 direct greedy 只有 0.890625；
+   当前更适合作为辅助方向，而不是主路线。
+
+5. baseline 的 sample + 1-bit greedy 最高为 0.899740，
+   但这是 sample 路线；当前目标是 direct rounding + 1-bit greedy 过 0.90，
+   所以 memory+XY 更符合“优化概率分布本身”的方向。
+```
+
+#### 18.25.5 当前结论和下一步
+
+当前最值得聚焦的模型方向：
+
+```text
+V14 candidate = V13 + RZ phase memory + XY phase feedback
+```
+
+它的意义：
+
+```text
+1. 不靠 teacher。
+2. 不改成 deterministic rounding loss。
+3. 不只是调 threshold。
+4. 让 SQNN 的 Bloch 相位动力学自己形成更好的概率分布。
+5. 与未来 QAOA/量子相位机制更一致。
+```
+
+下一步建议：
+
+```text
+A. 以 memory+XY 为主线，扫 phase_memory_decay:
+   0.50 / 0.65 / 0.80 / 0.90 / 0.95
+
+B. 扫 xy_feedback_init:
+   0.01 / 0.03 / 0.05 / 0.08 / 0.12
+
+C. 合并 memory+XY + node gate：
+   当前两者都正向，但还没组合。
+
+D. 合并 memory+XY + entropy lower：
+   entropy lower 之前把 direct greedy 推到 0.894531；
+   memory+XY 已经到 0.893229；
+   二者组合最可能冲 0.90。
+
+E. 做多 symmetry_seed：
+   当前结果只说明 seed=42 有效；
+   如果要证明模型路线，需要至少 5 个 seed 的稳定性。
+
+F. 保留 vector mix 为辅助项：
+   它能让 vector ratio 提高到 0.847257；
+   但在 direct greedy 上还没赢 memory+XY，
+   下一步可以尝试更小的 vector_loss_weight = 0.05 / 0.10 / 0.20。
+```
+
+### 18.26 MaxCut-3 模型路线重梳理：从 0.90 到 0.95
+
+用户重新明确目标：
+
+```text
+当前短期目标：突破 0.90
+最终目标：突破 0.95，尽量接近强 classical baseline
+
+但改进方向不能偏离原始思想：
+1. 最终仍用 Z 基表征 0/1 概率；
+2. RZ/XY 主要作为相位信息和相邻变量关系的表达通道；
+3. 不优先做导致变量数量急剧增加的 node gate；
+4. 不把完整 Bloch 向量反相关当作 MaxCut 主目标。
+```
+
+#### 18.26.1 当前正在优化的 MaxCut-3 模型
+
+当前主线问题是：
+
+```text
+random_regular_maxcut
+average_degree = 3
+无权 3-正则图 MaxCut
+ratio denominator = total edge weight
+```
+
+当前主线模型是 V13 / phase-aware V14 candidate：
+
+```text
+每个变量 i 维护一个 Bloch 向量：
+r_i^t = (X_i^t, Y_i^t, Z_i^t)
+
+最终 Z 基概率：
+p_i^t = (1 - Z_i^t) / 2
+
+最终二值读出：
+x_i = 1 if p_i >= 0.5 else 0
+```
+
+每一轮的基本动力学：
+
+```text
+1. 根据当前概率 p^t 计算 Z-basis local field:
+   F_i^t = linear_i + sum_j Q_ij p_j^t
+
+2. RZ 在 XY 平面积累相位：
+   只改变 X/Y，不直接改变 Z 和 p_i
+
+3. RY 把部分 X/Y 相位信息转回 Z：
+   这一步才改变 p_i
+
+4. 计算 J_i^t:
+   J_i^t = -F_i^t * (p_i^{t+1} - p_i^t)
+
+5. trust-region / J penalty 控制每轮方向不要严重违背局部下降方向。
+```
+
+当前主 loss 仍保持 measurement-faithful：
+
+```text
+L = normalized Z-basis expected MaxCut energy
+    + j_weight * ReLU(-J)
+    - entropy_weight * entropy
+```
+
+这里的关键点：
+
+```text
+MaxCut 真正要求相反的是最终 Z 基测量结果，
+不是完整 Bloch 向量 r_i 和 r_j。
+
+因此 full vector anti-alignment 不能作为主目标。
+XY/RZ 的价值在于：它能不能帮助模型形成更好的 Z 概率分布。
+```
+
+当前代表性结果：
+
+| route | n | expected | direct round + 1-bit greedy | sample + 1-bit greedy | note |
+|---|---:|---:|---:|---:|---|
+| pure V13 best historical | 512 | `0.826725` | `0.889323` | `0.897135` | 当前强基线之一 |
+| pure V13 large sample | 512 | - | - | `0.901042` | sample 路线，非 direct 主目标 |
+| phase baseline RY | 512 | `0.811755` | `0.881510` | `0.899740` | phase-aware 对照 |
+| memory+XY | 512 | `0.875292` | `0.893229` | `0.895833` | 当前最重要相位路线 |
+| double RZ | 512 | `0.785008` | `0.891927` | `0.897135` | 有正向作用但不如 memory+XY |
+| entropy lower historical | 512 | - | `0.894531` | `0.897135` | 不改主 loss 结构的有效 schedule |
+
+阶段目标：
+
+```text
+T1: n=512, seed=42, direct round + 1-bit greedy > 0.90
+T2: n=512 多 seed 平均稳定 > 0.90
+T3: n=1024 仍能 > 0.90
+T4: 最终向 0.95 靠近；
+    这需要模型本身更好表达相邻变量关系，
+    不能只靠 threshold / sampling 小修。
+```
+
+#### 18.26.2 暂缓或不作为主线的方向
+
+**A. node gate 暂缓**
+
+```text
+node gate = 让每个变量拥有自己的有效步长。
+
+问题：
+1. 当前提升不大；
+2. 容易导致优化变量数量、自由度、调参复杂度上升；
+3. 不如 RZ/XY 相位路线贴合当前理论动机。
+
+结论：
+暂时不作为下一阶段主线。
+```
+
+**B. full vector loss 不作为主线**
+
+full vector loss 指直接奖励完整 Bloch 向量反相关：
+
+```text
+C_vec = sum_(i,j) w_ij * (1 - r_i · r_j) / 2
+r_i = (X_i, Y_i, Z_i)
+
+L = L_Z - lambda * C_vec
+```
+
+这个项的含义是：希望相邻点的完整 3D Bloch 向量反向。
+
+问题：
+
+```text
+MaxCut 的物理目标是 Z-basis:
+C_Z = sum_(i,j) w_ij * (1 - Z_i Z_j) / 2
+
+full vector loss 会额外引入 XX / YY 反相关倾向。
+它可能让 XY 平面看起来很有结构，
+但最终 Z 基测量得到的 0/1 不一定更好。
+```
+
+因此：
+
+```text
+full vector loss 只能作为很谨慎的辅助/诊断路线，
+不进入当前主线。
+```
+
+**C. threshold / Bernoulli sampling 不作为主改进**
+
+```text
+threshold sweep、sampling、uncertain shell 都可以作为读出诊断，
+但当前要突破 0.90 / 0.95，核心必须是模型概率分布变好。
+```
+
+**D. teacher guidance / deterministic rounding loss 继续删除**
+
+```text
+没有优化完成的 teacher，不做 teacher guidance。
+不把 rounding loss 加进 L，避免损失函数变脏。
+```
+
+#### 18.26.3 适合继续探索的主线方向
+
+当前最适合探索的是：
+
+```text
+measurement-faithful phase relation SQNN
+
+即：
+Z 负责最终概率；
+XY/RZ 负责隐藏相位、历史信息、相邻变量关系；
+所有相位信息最后必须通过 RY 或很小的 pre-measurement rotation 回到 Z。
+```
+
+**方向 1：neighbor XY message**
+
+目标：让相邻变量的 XY 信息进入 RZ 相位更新，但不直接进入 loss。
+
+可选形式：
+
+```text
+u_i^t = sum_j w_ij X_j^t
+v_i^t = sum_j w_ij Y_j^t
+
+neighbor_xy_i^t = alpha_t * u_i^t + beta_t * v_i^t
+
+RZ_angle_i^t =
+    a_t * F_i^t
+  + b_t * phase_memory_i^t
+  + c_t * neighbor_xy_i^t
+```
+
+含义：
+
+```text
+邻居的相位状态影响当前节点的 RZ 相位；
+但最终好坏仍由 Z-basis expected energy 判断。
+```
+
+优势：
+
+```text
+1. 不增加每个节点的独立参数；
+2. 能显式表达相邻变量之间的联系；
+3. 保持 Z 基测量主线。
+```
+
+**方向 2：neighbor phase-difference message**
+
+用 XY 相位角：
+
+```text
+phi_i^t = atan2(Y_i^t, X_i^t)
+```
+
+构造边上的相位差消息：
+
+```text
+d_i^t = sum_j w_ij * sin(phi_j^t - phi_i^t)
+```
+
+进入 RZ：
+
+```text
+RZ_angle_i^t =
+    a_t * F_i^t
+  + b_t * memory_i^t
+  + c_t * d_i^t
+```
+
+含义：
+
+```text
+不是要求 r_i 和 r_j 反向；
+而是让边上的相位差影响后续 Z 概率演化。
+```
+
+这是最贴合“RZ 带来 XY 相位积累”的方向。
+
+**方向 3：phase memory schedule**
+
+当前 memory+XY 使用：
+
+```text
+m_i^t = rho * m_i^{t-1} + F_i^t
+```
+
+下一步继续探索：
+
+```text
+rho = 0.50 / 0.65 / 0.80 / 0.90 / 0.95
+xy_feedback_init = 0.01 / 0.03 / 0.05 / 0.08 / 0.12
+```
+
+但要补充新的判断：
+
+```text
+只扫 memory 参数不够；
+必须加入 neighbor relation message，
+否则相位只是单点历史，不够表达边关系。
+```
+
+**方向 4：two-stage Z-collapse**
+
+目标：前期让 XY 相位积累关系，后期把相位压回 Z 概率。
+
+形式：
+
+```text
+stage 1: phase relation building
+  RZ memory / neighbor phase message 较强
+  entropy 较高，允许探索
+
+stage 2: Z collapse
+  RY mixer 更强
+  entropy 降低
+  J/trust 更严格
+  把 XY 相位信息转成 Z 概率差异
+```
+
+这条路线比 full vector loss 更物理：
+
+```text
+不要求完整向量反向；
+只要求相位信息最终能帮助 Z 基 MaxCut。
+```
+
+**方向 5：small final pre-measurement rotation**
+
+用户认为这是可试方向，但不能偏离 Z 表征概率。
+
+定义：
+
+```text
+r_i' = R_final r_i
+p_i = (1 - Z_i') / 2
+```
+
+解释：
+
+```text
+这不是放弃 Z 测量；
+而是在最终 Z 测量前加一个很小的统一校准旋转。
+```
+
+必须加约束：
+
+```text
+|theta_final| <= 0.05 或 0.10 rad
+rotation penalty = gamma * ||theta_final||^2
+```
+
+并且报告必须同时给出：
+
+```text
+1. no-rotation Z readout
+2. small-rotation Z readout
+3. learned final rotation angle
+```
+
+判定标准：
+
+```text
+如果收益主要来自很大的 final rotation，则路线无效；
+如果小角度 rotation 稳定带来 1-3 条边收益，可以保留。
+```
+
+**方向 6：projected relation diagnostic，不先做 loss**
+
+可以观察：
+
+```text
+q_i = n · r_i
+C_projected = sum_(i,j) w_ij * (1 - q_i q_j) / 2
+```
+
+但先只作为诊断：
+
+```text
+模型内部是否真的形成了某个方向上的反相关？
+这个方向能否通过小 final rotation 回到 Z？
+```
+
+暂时不把它作为主 loss。
+
+#### 18.26.4 下一轮最应该跑的实验组
+
+下一轮实验先不碰 node gate，也不碰 full vector loss。
+
+建议优先跑：
+
+| id | route | 目的 |
+|---|---|---|
+| P0 | memory+XY baseline rerun | 作为相位路线对照 |
+| P1 | memory+XY + neighbor XY message | 测邻居 XY 状态能否提升 Z 概率 |
+| P2 | memory+XY + phase-difference message | 测边相位差是否能表达相邻变量联系 |
+| P3 | memory+XY + two-stage Z-collapse | 测相位信息能否更彻底压回 Z |
+| P4 | memory+XY + entropy lower | 结合历史有效 schedule，冲 0.90 |
+| P5 | P2 + two-stage Z-collapse + entropy lower | 最可能突破 0.90 的主候选 |
+| P6 | P5 + small final rotation bound 0.05 | 测小幅测量前校准是否有收益 |
+| P7 | P5 + small final rotation bound 0.10 | 测稍大但仍受限的校准 |
+
+固定评价指标：
+
+```text
+direct rounding only
+direct rounding + 1-bit greedy
+sample + 1-bit greedy 只作参考
+expected ratio
+final confidence / probability std
+J violation
+final rotation angle
+unrotated vs rotated Z-readout gap
+```
+
+执行顺序：
+
+```text
+1. n=512, seed=42 快速确认能否 > 0.90
+2. 对最好 2-3 条路线做 symmetry_seed 多起点
+3. 做 5 个 graph seed 稳定性
+4. 扩到 n=1024
+```
+
+#### 18.26.5 对 0.95 目标的判断
+
+当前只靠：
+
+```text
+threshold 调整
+sampling
+单点 memory 参数扫描
+```
+
+很难把 direct route 从 `0.893` 推到 `0.95`。
+
+要接近 `0.95`，模型必须获得更强的相邻变量关系表达能力：
+
+```text
+1. 边上的相位差要能被模型感知；
+2. 邻居 XY 状态要能影响当前 RZ 相位；
+3. 后期必须把 XY 相位关系压回 Z；
+4. final rotation 只能作为小幅校准，不能成为换测量基；
+5. 必须多 seed 验证，不接受单个 seed 偶然好结果。
+```
+
+当前路线判断：
+
+```text
+最符合原始思想的 V14 主线：
+
+V14-Z-Phase =
+    V13 J-regularized Z-basis SQNN
+  + RZ phase memory
+  + neighbor XY / phase-difference message
+  + two-stage Z-collapse
+  + optional small final pre-measurement rotation
+
+不包括：
+  node gate 主线
+  full vector loss 主线
+  teacher guidance
+  deterministic rounding loss
+```
+
+### 18.27 MaxCut-3 标准化问题定义、能量函数与目标指标
+
+本节用于统一后续所有报告和实验命名，避免混用：
+
+```text
+cut value
+QUBO energy
+Z-spin Hamiltonian
+cut fraction
+approximation ratio
+```
+
+#### 18.27.1 图、变量和边权
+
+MaxCut-3 使用图：
+
+```text
+G = (V, E)
+|V| = n
+每个节点度数为 3
+```
+
+二值变量：
+
+```text
+x_i in {0, 1}
+```
+
+spin / Z 变量：
+
+```text
+s_i = 1 - 2 x_i
+s_i in {+1, -1}
+```
+
+边权：
+
+```text
+w_ij >= 0
+```
+
+`w_ij` 的含义：
+
+```text
+w_ij 是边 (i,j) 的权重。
+当前 random_regular_maxcut / MaxCut-3 是无权 3-正则图：
+  如果 (i,j) in E，则 w_ij = 1；
+  如果 (i,j) not in E，则不进入求和，也可视为 w_ij = 0。
+```
+
+总边权：
+
+```text
+W = sum_(i,j in E) w_ij
+```
+
+在当前无权 MaxCut-3 中：
+
+```text
+W = |E| = 3n / 2
+```
+
+例如：
+
+```text
+n = 512  -> W = 768
+n = 1024 -> W = 1536
+```
+
+#### 18.27.2 主流 MaxCut 目标函数
+
+MaxCut 的标准目标是最大化 cut weight：
+
+```text
+C(x) = sum_(i,j in E) w_ij * 1[x_i != x_j]
+```
+
+用 spin / Z 变量写成：
+
+```text
+C(s) = sum_(i,j in E) w_ij * (1 - s_i s_j) / 2
+```
+
+这是最接近 QAOA/Ising 主流写法的形式。
+
+QAOA MaxCut cost Hamiltonian 通常写作：
+
+```text
+H_C = sum_(i,j in E) w_ij * (I - Z_i Z_j) / 2
+```
+
+QAOA 目标是最大化：
+
+```text
+<H_C>
+```
+
+#### 18.27.3 本项目当前优化的能量
+
+本项目代码内部采用 QUBO energy，并通过最小化能量来最大化 cut。
+
+对于一条边 `(i,j)`：
+
+```text
+E_ij(x) = -w_ij x_i - w_ij x_j + 2 w_ij x_i x_j
+```
+
+检查：
+
+```text
+如果 x_i != x_j，则 E_ij = -w_ij
+如果 x_i == x_j，则 E_ij = 0
+```
+
+因此：
+
+```text
+E_QUBO(x)
+= sum_(i,j in E) [-w_ij x_i - w_ij x_j + 2 w_ij x_i x_j]
+= -C(x)
+```
+
+所以：
+
+```text
+minimize E_QUBO(x)  <=>  maximize C(x)
+```
+
+代码对应：
+
+```text
+quantum/warmstart/benchmarks.py
+  maxcut_qubo_from_edges(...)
+
+linear_i 加入 -w_ij
+quadratic edge_weight 加入 2 w_ij
+```
+
+#### 18.27.4 概率模型和 Z 基测量
+
+SQNN 每个变量维护 Bloch 向量：
+
+```text
+r_i = (X_i, Y_i, Z_i)
+```
+
+最终 0/1 概率由 Z 基给出：
+
+```text
+p_i = P(x_i = 1) = (1 - Z_i) / 2
+```
+
+当前模型采用独立 Bernoulli 近似：
+
+```text
+P(x) approx product_i Bernoulli(p_i)
+```
+
+因此概率形式下的 expected cut 是：
+
+```text
+C(p) = sum_(i,j in E) w_ij * [p_i (1 - p_j) + p_j (1 - p_i)]
+     = sum_(i,j in E) w_ij * [p_i + p_j - 2 p_i p_j]
+```
+
+对应 expected QUBO energy：
+
+```text
+E_QUBO(p)
+= sum_(i,j in E) [-w_ij p_i - w_ij p_j + 2 w_ij p_i p_j]
+= -C(p)
+```
+
+用 Z 期望写成：
+
+```text
+C(Z) = sum_(i,j in E) w_ij * (1 - Z_i Z_j) / 2
+E_Z  = -C(Z)
+```
+
+这里的 `Z_i` 是当前 product-state / mean-field 下的单点 Z 期望。
+
+关键原则：
+
+```text
+MaxCut 真正需要反相关的是 Z 基测量结果；
+XY/RZ 可以表达隐藏相位和相邻变量关系，
+但最终必须转化为更好的 Z_i / p_i。
+```
+
+#### 18.27.5 当前训练 loss 的标准写法
+
+当前主线训练 loss：
+
+```text
+L =
+    E_QUBO(p) / scale
+  + lambda_J * mean_i,t ReLU(-J_i^t)
+  - lambda_H * H_Bernoulli(p)
+```
+
+其中：
+
+```text
+E_QUBO(p) = -C(p)
+```
+
+`J_i^t` 是每轮每个变量的局部方向约束：
+
+```text
+F_i^t = d E_QUBO(p) / d p_i
+
+J_i^t = -F_i^t * (p_i^{t+1} - p_i^t)
+```
+
+含义：
+
+```text
+如果 J_i^t > 0，说明这一轮变量 i 的概率变化方向符合局部下降方向；
+如果 J_i^t < 0，说明该变量这一步朝局部错误方向走。
+```
+
+代码中实际调用：
+
+```text
+energy = problem.expected_energy(probabilities)
+loss = normalized_energy
+       - entropy_weight * entropy
+       + j_weight * ReLU(-J)
+```
+
+#### 18.27.6 指标命名：cut fraction vs approximation ratio
+
+后续必须区分两个指标。
+
+**1. cut fraction / normalized cut**
+
+```text
+rho_W(x) = C(x) / W
+```
+
+其中：
+
+```text
+W = sum_(i,j in E) w_ij
+```
+
+当前大多数 MaxCut-3 表格里的 ratio 实际是：
+
+```text
+cut fraction = C / total edge weight
+```
+
+它不是严格 approximation ratio。
+
+**2. approximation ratio**
+
+如果知道最优 cut：
+
+```text
+C_star = max_x C(x)
+```
+
+则真正近似比是：
+
+```text
+alpha(x) = C(x) / C_star
+```
+
+对于大规模 random regular MaxCut-3，`C_star` 通常不直接知道，因此当前先报告：
+
+```text
+rho_W = C / W
+```
+
+后续如果用 exact solver / 强 classical solver 得到 best-known：
+
+```text
+C_best_known
+```
+
+则同时报告：
+
+```text
+alpha_best = C / C_best_known
+```
+
+报告规范：
+
+```text
+不能只写 ratio。
+必须写清楚是：
+  cut_fraction_C_over_W
+还是：
+  approx_ratio_C_over_Cstar / C_over_best_known
+```
+
+#### 18.27.7 当前目标值标准化
+
+当前所有 `0.90` / `0.95` 目标，默认先指：
+
+```text
+cut_fraction_C_over_W
+```
+
+也就是：
+
+```text
+C(x) / total_edge_weight
+```
+
+短期目标：
+
+```text
+n = 512, MaxCut-3
+direct rounding + 1-bit greedy
+cut_fraction_C_over_W > 0.90
+```
+
+中期目标：
+
+```text
+n = 512，多 graph seed / symmetry seed 稳定 > 0.90
+n = 1024，仍能 > 0.90
+```
+
+最终目标：
+
+```text
+cut_fraction_C_over_W > 0.95
+并尽量接近强 classical baseline / best-known cut。
+```
+
+如果后续拿到 best-known / exact optimum，则目标改写为双指标：
+
+```text
+cut_fraction_C_over_W
+approx_ratio_C_over_best_known
+```
+
+并明确区分：
+
+```text
+cut fraction 高，不一定等于 approximation ratio 高；
+但对于 MaxCut-3，它是当前最稳定、最容易跨规模比较的主指标。
+```
+
+#### 18.27.8 当前主线模型目标
+
+当前主线不是优化 full vector anti-alignment：
+
+```text
+不是 maximize sum w_ij * (1 - r_i · r_j) / 2
+```
+
+当前主线是：
+
+```text
+最大化 Z-basis expected cut:
+C(p) = sum_(i,j in E) w_ij * [p_i + p_j - 2 p_i p_j]
+
+等价于最小化：
+E_QUBO(p) = -C(p)
+```
+
+同时探索：
+
+```text
+RZ / XY 相位如何表达相邻变量关系，
+并最终通过 RY 或 small final pre-measurement rotation
+转化成更好的 Z_i / p_i。
+```
+
+当前 V14-Z-Phase 主线：
+
+```text
+V14-Z-Phase =
+    V13 J-regularized Z-basis SQNN
+  + RZ phase memory
+  + neighbor XY / phase-difference message
+  + two-stage Z-collapse
+  + optional small final pre-measurement rotation
+```
+
+明确不作为主线：
+
+```text
+node gate
+full vector loss
+teacher guidance
+deterministic rounding loss
+large final rotation / non-Z readout
+```

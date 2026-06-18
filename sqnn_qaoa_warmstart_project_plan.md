@@ -7718,3 +7718,62 @@ seed=99:
    - 用 early diagnostics 自动选择 gain；
    - 对 seed=7/23 这类失败实例做 failure-mode analysis。
 ```
+
+补充同 seed classical baseline 后，差距更明确：
+
+```text
+outputs/maxcut3_baselines_seed7_fast/
+outputs/maxcut3_baselines_seed23_fast/
+outputs/maxcut3_baselines_seed42_fast/
+outputs/maxcut3_baselines_seed99_fast/
+outputs/maxcut3_v14_seed_stability_gain14/
+```
+
+同口径 low-rank GW-style + 1-bit greedy baseline：
+
+```text
+seed=7:
+  SQNN direct = 0.872396
+  random+greedy = 0.875000
+  GW-style = 0.915365
+  direct gap to GW = 0.042969
+
+seed=23:
+  SQNN direct = 0.881510
+  random+greedy = 0.873698
+  GW-style = 0.916667
+  direct gap to GW = 0.035156
+
+seed=42:
+  SQNN direct = 0.901042
+  random+greedy = 0.881510
+  GW-style = 0.925781
+  direct gap to GW = 0.024740
+
+seed=99:
+  SQNN direct = 0.893229
+  random+greedy = 0.871094
+  GW-style = 0.914062
+  direct gap to GW = 0.020833
+
+4-seed mean:
+  SQNN direct = 0.887044
+  SQNN sample = 0.890625
+  GW-style = 0.917969
+```
+
+更新后的判断：
+
+```text
+1. 当前 SQNN 已经明显超过 random+greedy 的若干 seed，
+   但 seed=7 甚至略低于 random+greedy。
+
+2. 相对 GW-style，mean gap 约 0.031。
+   这说明“接近 GW”还没有完成，当前最好结果更像潜力展示，不是稳定算法。
+
+3. 下一轮最值得做：
+   - 多 symmetry restarts：同一图多初始扰动选 best；
+   - per-instance gain calibration：不要固定 gain=1.4；
+   - failure-mode analysis：对 seed=7/23 看是否过早高置信锁错；
+   - 用早期 trace 指标预测该走 gain=1.4、1.8，还是更保守路线。
+```

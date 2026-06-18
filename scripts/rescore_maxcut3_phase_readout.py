@@ -19,7 +19,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from explore_j_regularized_sqnn import load_summary, make_train_args  # noqa: E402
 from quantum.warmstart import greedy_local_search, sample_bernoulli  # noqa: E402
-from run_maxcut3_phase_aware_probe import PhaseAwareJRegularizedSQNN  # noqa: E402
+from run_maxcut3_phase_aware_probe import MultiHeadPhaseAwareSQNN, PhaseAwareJRegularizedSQNN  # noqa: E402
 from run_qubo_warmstart import make_benchmark, ratio_value  # noqa: E402
 
 
@@ -41,9 +41,7 @@ def as_bool(value, default=False):
 
 
 def build_phase_model(config, problem, device):
-    return PhaseAwareJRegularizedSQNN(
-        num_variables=problem.num_variables,
-        message_rounds=int(config["rounds"]),
+    model_kwargs = dict(
         trust_mode=config.get("trust_mode", "fixed"),
         trust_shrink=float(config["trust_shrink"]),
         trust_threshold=float(config["trust_threshold"]),
@@ -63,7 +61,22 @@ def build_phase_model(config, problem, device):
         phase_diff_init=float(config.get("phase_diff_init", 0.0)),
         collapse_init=float(config.get("collapse_init", 0.0)),
         final_rotation_max=float(config.get("final_rotation_max", 0.0)),
+        edge_message_decay=float(config.get("edge_message_decay", 0.70)),
+        edge_message_self_mix=float(config.get("edge_message_self_mix", 0.50)),
         node_step_mode=config.get("node_step_mode", "none"),
+    )
+    if int(config.get("head_count", 1)) > 1:
+        return MultiHeadPhaseAwareSQNN(
+            num_variables=problem.num_variables,
+            message_rounds=int(config["rounds"]),
+            head_count=int(config.get("head_count", 1)),
+            head_seed_stride=int(config.get("head_seed_stride", 7919)),
+            **model_kwargs,
+        ).to(device)
+    return PhaseAwareJRegularizedSQNN(
+        num_variables=problem.num_variables,
+        message_rounds=int(config["rounds"]),
+        **model_kwargs,
     ).to(device)
 
 

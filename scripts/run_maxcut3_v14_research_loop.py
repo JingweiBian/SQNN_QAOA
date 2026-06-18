@@ -201,6 +201,10 @@ def config_from_row(base, args, row, phase, rounds, epochs, overrides=None, seed
             "phase_diff_init": as_float(row.get("phase_diff_init"), 0.0),
             "collapse_init": as_float(row.get("collapse_init"), 0.0),
             "final_rotation_max": as_float(row.get("final_rotation_max"), 0.0),
+            "edge_message_decay": as_float(row.get("edge_message_decay"), 0.70),
+            "edge_message_self_mix": as_float(row.get("edge_message_self_mix"), 0.50),
+            "head_count": int(as_float(row.get("head_count"), 1)),
+            "head_seed_stride": int(as_float(row.get("head_seed_stride"), 7919)),
             "trust_mode": row.get("trust_mode", config.get("trust_mode", "two_stage")) or "two_stage",
             "trust_shrink": as_float(row.get("trust_shrink"), config.get("trust_shrink", 0.25)),
             "trust_threshold": as_float(row.get("trust_threshold"), config.get("trust_threshold", 1e-4)),
@@ -276,6 +280,29 @@ def propose_next_cycle(base, args, cycle, summary_rows):
                 {"lr": max(as_float(row.get("lr"), 0.003) * 0.65, 5e-4)},
             )
         )
+        if int(as_float(row.get("head_count"), 1)) == 1 and rank == 0:
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
+                    f"{base_name}_multihead3",
+                    base_rounds,
+                    base_epochs,
+                    {"head_count": 3, "head_seed_stride": 7919},
+                )
+            )
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
+                    f"{base_name}_multihead5",
+                    max(int(base_rounds * 0.75), int(args.screen_rounds)),
+                    max(int(base_epochs * 0.75), int(args.screen_epochs)),
+                    {"head_count": 5, "head_seed_stride": 7919},
+                )
+            )
         if "neighbor_xy" in mode and "collapse" in mode:
             neighbor_value = as_float(row.get("neighbor_phase_init"), 0.05)
             configs.append(
@@ -372,6 +399,84 @@ def propose_next_cycle(base, args, cycle, summary_rows):
                         "neighbor_phase_init": 0.05,
                         "collapse_init": 0.03,
                     },
+                )
+            )
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
+                    f"{base_name}_mem_xy_edge_cavity",
+                    base_rounds,
+                    base_epochs,
+                    {
+                        "phase_mode": "memory_xy_feedback_edge_cavity_xy",
+                        "neighbor_phase_init": 0.05,
+                        "edge_message_decay": 0.70,
+                        "edge_message_self_mix": 0.50,
+                    },
+                )
+            )
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
+                    f"{base_name}_mem_xy_edge_cavity_collapse",
+                    base_rounds,
+                    base_epochs,
+                    {
+                        "phase_mode": "memory_xy_feedback_edge_cavity_xy_collapse",
+                        "neighbor_phase_init": 0.05,
+                        "collapse_init": 0.03,
+                        "edge_message_decay": 0.70,
+                        "edge_message_self_mix": 0.50,
+                    },
+                )
+            )
+        if "edge_cavity_xy" in mode:
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
+                    f"{base_name}_edge_decay_045",
+                    base_rounds,
+                    base_epochs,
+                    {"edge_message_decay": 0.45},
+                )
+            )
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
+                    f"{base_name}_edge_decay_085",
+                    base_rounds,
+                    base_epochs,
+                    {"edge_message_decay": 0.85},
+                )
+            )
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
+                    f"{base_name}_edge_selfmix_025",
+                    base_rounds,
+                    base_epochs,
+                    {"edge_message_self_mix": 0.25},
+                )
+            )
+            configs.append(
+                config_from_row(
+                    base,
+                    args,
+                    row,
+                    f"{base_name}_edge_selfmix_075",
+                    base_rounds,
+                    base_epochs,
+                    {"edge_message_self_mix": 0.75},
                 )
             )
             configs.append(

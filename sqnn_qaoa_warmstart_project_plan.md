@@ -7032,3 +7032,173 @@ direct rounding + 1-bit greedy 暂时平台约为 C/W = 0.895833。
    继续保留 C/W 快速指标；
    每个关键结果同步保存 C/C_best_known，对齐 GW / Google QAOA 的正式写法。
 ```
+
+#### 18.29.5 Extended probes: edge-cavity, multi-head, entropy schedule
+
+本轮继续围绕 random 3-regular MaxCut, n=512, seed=42 探索三个方向：
+
+```text
+1. directed-edge cavity message state
+2. multi-head phase channels
+3. late-stage entropy schedule / confidence sharpening
+```
+
+新增汇总输出：
+
+```text
+outputs/maxcut3_v14_extended_review/
+  maxcut3_v14_extended_review.png
+  maxcut3_v14_extended_review.md
+```
+
+##### Directed-edge cavity message state
+
+代码新增：
+
+```text
+phase_mode = memory_xy_feedback_edge_cavity_xy
+phase_mode = memory_xy_feedback_edge_cavity_xy_collapse
+```
+
+含义：
+
+```text
+每条无向边拆成两个 directed messages；
+message u->v 使用 u 侧除去 v->u 的 incoming cavity 信息；
+再聚合到节点，作为隐藏 XY phase torque；
+最终仍然只通过 Z-basis probability p_i 读出。
+```
+
+结果：
+
+```text
+memory_xy_feedback_edge_cavity_xy:
+  direct + 1-bit greedy = 0.891927
+  sample + 1-bit greedy = 0.894531
+
+memory_xy_feedback_edge_cavity_xy_collapse:
+  direct + 1-bit greedy = 0.891927
+  sample + 1-bit greedy = 0.898438
+  8192-sample rescore = 0.899740
+```
+
+结论：
+
+```text
+edge-cavity 没有提升 deterministic direct readout；
+但 collapse 版本的 sample readout 保持接近 0.90。
+它说明 directed-edge message 可以保留一部分好解分布，
+但还没有解决 direct rounding 平台。
+```
+
+##### Multi-head phase channels
+
+代码新增：
+
+```text
+head_count > 1
+MultiHeadPhaseAwareSQNN
+```
+
+读出方式：
+
+```text
+多个 V14 heads 并行演化；
+每个 head 仍输出 Z-basis probability；
+最终用 trainable head weights 聚合 logits，再 sigmoid 得到 p_i。
+```
+
+结果：
+
+```text
+multihead memory_xy:
+  direct + 1-bit greedy = 0.877604
+  sample + 1-bit greedy = 0.856771
+
+multihead memory_xy_neighbor_collapse:
+  direct + 1-bit greedy = 0.885417
+  sample + 1-bit greedy = 0.891927
+```
+
+结论：
+
+```text
+当前 multi-head 实现太软；
+final_mean_confidence 只有约 0.326，
+明显低于单头 top route 的约 0.499。
+
+简单 multi-head logit 聚合不是当前突破口。
+如果继续 multi-head，需要设计 head agreement / sharper readout 机制，
+否则 direct rounding 会被多个 head 的不一致性冲淡。
+```
+
+##### Late-stage entropy schedule
+
+测试：
+
+```text
+entropy_weight = 0.01
+final_entropy_weight = 0.0
+
+entropy_weight = 0.01
+final_entropy_weight = -0.003
+```
+
+结果：
+
+```text
+entropy_zero:
+  direct + 1-bit greedy = 0.895833
+  expected C/W = 0.892205
+
+entropy_sharp:
+  direct + 1-bit greedy = 0.895833
+  expected C/W = 0.892285
+```
+
+结论：
+
+```text
+后期 entropy sharpening 没有突破 direct readout 平台。
+它略微稳定了 expected ratio，
+但最终二值解仍卡在 0.895833。
+```
+
+##### 当前更新后的判断
+
+```text
+当前最强 deterministic direct route 仍为：
+  memory_xy_feedback + neighbor_xy + collapse + small final rotation
+  direct + 1-bit greedy = 0.895833
+
+当前最强 high-sample route：
+  sample + 1-bit greedy = 0.899740
+
+当前低秩 GW-style 对照：
+  C/W = 0.917969
+```
+
+下一步不建议继续局部扫参：
+
+```text
+edge decay / self mix
+entropy schedule
+simple multi-head
+longer rounds/epochs
+symmetry seed/strength
+```
+
+下一步更值得做的是从模型结构上引入更强的相邻变量关系表达：
+
+```text
+1. Z-consistent directed-edge message:
+   不只传 XY phase torque，也传 Z-consistency / cut preference message。
+
+2. residual-core targeted SQNN:
+   先让 V14 固定高置信变量，再对低置信 residual core 做第二段 SQNN，
+   但仍然保持 SQNN，不接外部 QAOA。
+
+3. agreement-aware multi-head:
+   多头不是简单平均，而是训练 head agreement 或 winner head readout；
+   需要小心不要退化成 teacher / rounding loss。
+```

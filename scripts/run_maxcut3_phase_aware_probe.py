@@ -49,11 +49,16 @@ EXTRA_SUMMARY_FIELDS = [
     "phase_memory_decay",
     "xy_feedback_init",
     "omega_init",
+    "neighbor_phase_init",
+    "phase_diff_init",
+    "collapse_init",
+    "final_rotation_max",
     "node_step_mode",
     "vector_loss_weight",
     "vector_best_ratio",
     "vector_final_ratio",
     "final_xy_radius",
+    "final_rotation_norm",
 ]
 PHASE_SUMMARY_FIELDS = list(dict.fromkeys([*SUMMARY_FIELDS, *EXTRA_SUMMARY_FIELDS]))
 
@@ -85,6 +90,10 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         phase_memory_decay=0.0,
         xy_feedback_init=0.0,
         omega_init=0.0,
+        neighbor_phase_init=0.0,
+        phase_diff_init=0.0,
+        collapse_init=0.0,
+        final_rotation_max=0.0,
         node_step_mode="none",
     ):
         super().__init__()
@@ -105,6 +114,7 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         self.symmetry_seed = int(symmetry_seed)
         self.phase_mode = str(phase_mode)
         self.phase_memory_decay = float(phase_memory_decay)
+        self.final_rotation_max = float(final_rotation_max)
         self.node_step_mode = str(node_step_mode)
 
         if initial_probabilities is None:
@@ -119,6 +129,12 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         self.mixer_bias = nn.Parameter(torch.full((self.message_rounds,), float(mixer_bias_init)))
         self.omega_steps = nn.Parameter(torch.full((self.message_rounds,), float(omega_init)))
         self.xy_feedback_steps = nn.Parameter(torch.full((self.message_rounds,), float(xy_feedback_init)))
+        self.neighbor_phase_steps = nn.Parameter(
+            torch.full((self.message_rounds,), float(neighbor_phase_init))
+        )
+        self.phase_diff_steps = nn.Parameter(torch.full((self.message_rounds,), float(phase_diff_init)))
+        self.collapse_steps = nn.Parameter(torch.full((self.message_rounds,), float(collapse_init)))
+        self.final_rotation_raw = nn.Parameter(torch.zeros(3))
         self.initial_angles = nn.Parameter(torch.zeros(3))
 
         self.node_gate_bias = nn.Parameter(torch.tensor(0.0))
@@ -220,6 +236,73 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         )
         return field / normalizer.clamp_min(1e-6)
 
+    def _neighbor_xy_signal(self, problem, bloch):
+        if problem.edge_index.numel() == 0:
+            zeros = torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
+            return zeros, zeros
+        src, dst = problem.edge_index
+        edge_weight = problem.edge_weight.to(device=self.device, dtype=self.dtype)
+        msg_x = torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
+        msg_y = torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
+        msg_x.index_add_(0, src, edge_weight * bloch[dst, 0])
+        msg_x.index_add_(0, dst, edge_weight * bloch[src, 0])
+        msg_y.index_add_(0, src, edge_weight * bloch[dst, 1])
+        msg_y.index_add_(0, dst, edge_weight * bloch[src, 1])
+        degree = problem.node_degrees(weighted=True, absolute=True).to(device=self.device, dtype=self.dtype)
+        msg_x = msg_x / degree.clamp_min(1e-6)
+        msg_y = msg_y / degree.clamp_min(1e-6)
+        # torque is positive when the node XY phase trails its weighted
+        # neighbor phase. Its trainable sign decides whether the model moves
+        # toward or away from neighbor phase alignment.
+        torque = bloch[:, 0] * msg_y - bloch[:, 1] * msg_x
+        alignment = bloch[:, 0] * msg_x + bloch[:, 1] * msg_y
+        return torque, alignment
+
+    def _phase_difference_signal(self, problem, bloch):
+        if problem.edge_index.numel() == 0:
+            return torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
+        src, dst = problem.edge_index
+        edge_weight = problem.edge_weight.to(device=self.device, dtype=self.dtype)
+        phase = torch.atan2(bloch[:, 1], bloch[:, 0])
+        edge_delta = torch.sin(phase[dst] - phase[src])
+        signal = torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
+        signal.index_add_(0, src, edge_weight * edge_delta)
+        signal.index_add_(0, dst, -edge_weight * edge_delta)
+        degree = problem.node_degrees(weighted=True, absolute=True).to(device=self.device, dtype=self.dtype)
+        return signal / degree.clamp_min(1e-6)
+
+    def _cavity_xy_signal(self, problem, bloch):
+        if problem.edge_index.numel() == 0:
+            zeros = torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
+            return zeros, zeros
+        src, dst = problem.edge_index
+        edge_weight = problem.edge_weight.to(device=self.device, dtype=self.dtype)
+        sum_x = torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
+        sum_y = torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
+        sum_x.index_add_(0, src, edge_weight * bloch[dst, 0])
+        sum_x.index_add_(0, dst, edge_weight * bloch[src, 0])
+        sum_y.index_add_(0, src, edge_weight * bloch[dst, 1])
+        sum_y.index_add_(0, dst, edge_weight * bloch[src, 1])
+        degree = problem.node_degrees(weighted=True, absolute=True).to(device=self.device, dtype=self.dtype)
+        cavity_degree = (degree - 1.0).clamp_min(1.0)
+
+        src_to_dst_x = (sum_x[src] - bloch[dst, 0]) / cavity_degree[src]
+        src_to_dst_y = (sum_y[src] - bloch[dst, 1]) / cavity_degree[src]
+        dst_to_src_x = (sum_x[dst] - bloch[src, 0]) / cavity_degree[dst]
+        dst_to_src_y = (sum_y[dst] - bloch[src, 1]) / cavity_degree[dst]
+
+        cav_x = torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
+        cav_y = torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
+        cav_x.index_add_(0, dst, edge_weight * src_to_dst_x)
+        cav_y.index_add_(0, dst, edge_weight * src_to_dst_y)
+        cav_x.index_add_(0, src, edge_weight * dst_to_src_x)
+        cav_y.index_add_(0, src, edge_weight * dst_to_src_y)
+        cav_x = cav_x / degree.clamp_min(1e-6)
+        cav_y = cav_y / degree.clamp_min(1e-6)
+        torque = bloch[:, 0] * cav_y - bloch[:, 1] * cav_x
+        alignment = bloch[:, 0] * cav_x + bloch[:, 1] * cav_y
+        return torque, alignment
+
     def _node_step_scale(self, local_field, old_probabilities):
         if self.node_step_mode != "learned_gate":
             return 1.0
@@ -233,27 +316,58 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         )
         return (2.0 * torch.sigmoid(logits)).clamp(0.05, 2.5)
 
-    def _propose_round(self, bloch, local_field, old_probabilities, round_index, phase_memory):
+    def _final_rotation_angles(self):
+        if self.final_rotation_max <= 0.0:
+            return torch.zeros(3, dtype=self.dtype, device=self.device)
+        limit = torch.as_tensor(self.final_rotation_max, dtype=self.dtype, device=self.device)
+        return limit * torch.tanh(self.final_rotation_raw.to(device=self.device, dtype=self.dtype))
+
+    def _apply_final_rotation(self, bloch):
+        if self.final_rotation_max <= 0.0:
+            return bloch
+        angles = self._final_rotation_angles().expand(self.num_variables, -1)
+        return _apply_bloch_rotation(bloch, angles)
+
+    def _propose_round(self, problem, bloch, local_field, old_probabilities, round_index, phase_memory):
         next_phase_memory = phase_memory
         phase_signal = local_field
-        if self.phase_mode in {"memory", "memory_xy_feedback", "memory_double_rz"}:
+        if "memory" in self.phase_mode:
             decay = torch.as_tensor(self.phase_memory_decay, dtype=self.dtype, device=self.device)
             next_phase_memory = decay * phase_memory + local_field
             phase_signal = next_phase_memory
 
+        neighbor_torque, neighbor_alignment = self._neighbor_xy_signal(problem, bloch)
+        cavity_torque, cavity_alignment = self._cavity_xy_signal(problem, bloch)
+        phase_diff_signal = self._phase_difference_signal(problem, bloch)
+        relation_signal = neighbor_torque
+        if "cavity_xy" in self.phase_mode:
+            relation_signal = cavity_torque
+        if "phase_diff" in self.phase_mode:
+            relation_signal = phase_diff_signal
+
         phase_angles = torch.zeros_like(bloch)
         phase_angles[:, 0] = self.phase_steps[round_index] * phase_signal
-        if self.phase_mode in {"xy_feedback", "memory_xy_feedback"}:
+        if "xy_feedback" in self.phase_mode:
             xy_phase = torch.atan2(bloch[:, 1], bloch[:, 0])
             phase_angles[:, 0] = phase_angles[:, 0] + self.xy_feedback_steps[round_index] * xy_phase
+        if "neighbor_xy" in self.phase_mode:
+            phase_angles[:, 0] = phase_angles[:, 0] + self.neighbor_phase_steps[round_index] * neighbor_torque
+        if "cavity_xy" in self.phase_mode:
+            phase_angles[:, 0] = phase_angles[:, 0] + self.neighbor_phase_steps[round_index] * cavity_torque
+        if "phase_diff" in self.phase_mode:
+            phase_angles[:, 0] = phase_angles[:, 0] + self.phase_diff_steps[round_index] * phase_diff_signal
 
         after_rz = _apply_bloch_rotation(bloch, phase_angles)
 
         mixer_angles = torch.zeros_like(bloch)
         step_scale = self._node_step_scale(local_field, old_probabilities)
         mixer_angles[:, 1] = self.mixer_bias[round_index] - self.field_steps[round_index] * step_scale * local_field
-        if self.phase_mode in {"double_rz", "memory_double_rz"}:
+        if "double_rz" in self.phase_mode:
             mixer_angles[:, 2] = self.omega_steps[round_index] * phase_signal
+        if "collapse" in self.phase_mode:
+            start_round = int(round(float(self.message_rounds) * self.two_stage_fraction))
+            if round_index >= start_round:
+                mixer_angles[:, 1] = mixer_angles[:, 1] + self.collapse_steps[round_index] * relation_signal
         raw_proposal = _apply_bloch_rotation(after_rz, mixer_angles)
         raw_proposal = _apply_bloch_noise(raw_proposal, self.noise_config)
 
@@ -284,6 +398,11 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
             "j": final_j,
             "after_rz_x": after_rz[:, 0],
             "phase_angle": phase_angles[:, 0],
+            "neighbor_torque": neighbor_torque,
+            "neighbor_alignment": neighbor_alignment,
+            "cavity_torque": cavity_torque,
+            "cavity_alignment": cavity_alignment,
+            "phase_diff_signal": phase_diff_signal,
         }
 
     def forward(self, problem, return_state=False):
@@ -308,6 +427,7 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
             old_probabilities = probabilities
             local_field = self._local_field(problem, old_probabilities)
             proposed_bloch, phase_memory, diagnostics = self._propose_round(
+                problem,
                 bloch,
                 local_field,
                 old_probabilities,
@@ -334,6 +454,13 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
             after_rz_x_trace.append(diagnostics["after_rz_x"])
             phase_angle_trace.append(diagnostics["phase_angle"])
 
+        bloch = self._apply_final_rotation(bloch)
+        probabilities = self._probabilities_from_bloch(bloch)
+        current_energy = problem.expected_energy(probabilities)
+        energy_trace[-1] = current_energy
+        probability_trace[-1] = probabilities
+        bloch_trace[-1] = bloch
+
         probabilities = torch.nan_to_num(probabilities, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
         if return_state:
             return {
@@ -349,6 +476,7 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
                 "raw_j_trace": torch.stack(raw_j_trace),
                 "after_rz_x_trace": torch.stack(after_rz_x_trace),
                 "phase_angle_trace": torch.stack(phase_angle_trace),
+                "final_rotation_angles": self._final_rotation_angles(),
             }
         return probabilities
 
@@ -425,32 +553,20 @@ def build_variants(base, rounds, epochs):
         phase_memory_decay=0.0,
         xy_feedback_init=0.0,
         omega_init=0.0,
+        neighbor_phase_init=0.0,
+        phase_diff_init=0.0,
+        collapse_init=0.0,
+        final_rotation_max=0.0,
         node_step_mode="none",
         vector_loss_weight=0.0,
     )
     variants = [
         (
-            "phase_baseline_random_ry_reference",
+            "v14_reference_random_ry",
             dict(symmetry_breaking="random_ry"),
         ),
         (
-            "phase_initial_random_rz_only",
-            dict(symmetry_breaking="random_rz"),
-        ),
-        (
-            "phase_initial_random_rz_plus_ry",
-            dict(symmetry_breaking="random_rz_ry"),
-        ),
-        (
-            "phase_memory_rz_signal",
-            dict(symmetry_breaking="random_rz_ry", phase_mode="memory", phase_memory_decay=0.80),
-        ),
-        (
-            "phase_xy_feedback",
-            dict(symmetry_breaking="random_rz", phase_mode="xy_feedback", xy_feedback_init=0.05),
-        ),
-        (
-            "phase_memory_xy_feedback",
+            "v14_memory_xy_reference",
             dict(
                 symmetry_breaking="random_rz_ry",
                 phase_mode="memory_xy_feedback",
@@ -459,20 +575,65 @@ def build_variants(base, rounds, epochs):
             ),
         ),
         (
-            "phase_double_rz",
-            dict(symmetry_breaking="random_rz_ry", phase_mode="double_rz", omega_init=0.05),
+            "v14_neighbor_xy_torque",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="neighbor_xy",
+                neighbor_phase_init=0.05,
+            ),
         ),
         (
-            "phase_node_step_gate",
-            dict(symmetry_breaking="random_rz_ry", phase_mode="baseline", node_step_mode="learned_gate"),
+            "v14_memory_neighbor_xy_torque",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_neighbor_xy",
+                phase_memory_decay=0.80,
+                neighbor_phase_init=0.05,
+            ),
         ),
         (
-            "phase_vector_relax_mixed",
+            "v14_neighbor_xy_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="neighbor_xy_collapse",
+                neighbor_phase_init=0.05,
+                collapse_init=0.03,
+            ),
+        ),
+        (
+            "v14_phase_diff_torque",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="phase_diff",
+                phase_diff_init=0.05,
+            ),
+        ),
+        (
+            "v14_phase_diff_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="phase_diff_collapse",
+                phase_diff_init=0.05,
+                collapse_init=0.03,
+            ),
+        ),
+        (
+            "v14_double_rz_small_final_rotation",
             dict(
                 symmetry_breaking="random_rz_ry",
                 phase_mode="double_rz",
                 omega_init=0.05,
-                vector_loss_weight=0.35,
+                final_rotation_max=0.08,
+            ),
+        ),
+        (
+            "v14_neighbor_xy_small_final_rotation",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="neighbor_xy_collapse",
+                neighbor_phase_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.08,
             ),
         ),
     ]
@@ -499,10 +660,16 @@ def phase_state_stats(benchmark, state, best_known):
     ratios = torch.stack([maxcut_vector_ratio(benchmark, item, best_known) for item in bloch_trace[1:]])
     final_bloch = bloch_trace[-1]
     xy_radius = torch.linalg.vector_norm(final_bloch[:, :2], dim=-1).mean()
+    final_rotation = state.get("final_rotation_angles")
+    if final_rotation is None:
+        rotation_norm = 0.0
+    else:
+        rotation_norm = torch.linalg.vector_norm(final_rotation).detach().cpu()
     return {
         "vector_best_ratio": float(ratios.max().detach().cpu()) if ratios.numel() else 0.0,
         "vector_final_ratio": float(ratios[-1].detach().cpu()) if ratios.numel() else 0.0,
         "final_xy_radius": float(xy_radius.detach().cpu()),
+        "final_rotation_norm": float(rotation_norm),
     }
 
 
@@ -560,6 +727,10 @@ def train_phase_one(config, device, output_dir):
         phase_memory_decay=float(config.get("phase_memory_decay", 0.0)),
         xy_feedback_init=float(config.get("xy_feedback_init", 0.0)),
         omega_init=float(config.get("omega_init", 0.0)),
+        neighbor_phase_init=float(config.get("neighbor_phase_init", 0.0)),
+        phase_diff_init=float(config.get("phase_diff_init", 0.0)),
+        collapse_init=float(config.get("collapse_init", 0.0)),
+        final_rotation_max=float(config.get("final_rotation_max", 0.0)),
         node_step_mode=config.get("node_step_mode", "none"),
     ).to(device)
     optimizer = torch.optim.AdamW(
@@ -620,8 +791,14 @@ def train_phase_one(config, device, output_dir):
                     "phase_step_mean": float(model.phase_steps.detach().mean().cpu()),
                     "omega_step_mean": float(model.omega_steps.detach().mean().cpu()),
                     "xy_feedback_mean": float(model.xy_feedback_steps.detach().mean().cpu()),
+                    "neighbor_phase_mean": float(model.neighbor_phase_steps.detach().mean().cpu()),
+                    "phase_diff_mean": float(model.phase_diff_steps.detach().mean().cpu()),
+                    "collapse_mean": float(model.collapse_steps.detach().mean().cpu()),
                     "mixer_bias_mean": float(model.mixer_bias.detach().mean().cpu()),
                     "symmetry_strength": float(model.current_symmetry_strength().detach().cpu()),
+                    "final_rotation_norm": float(
+                        torch.linalg.vector_norm(model._final_rotation_angles()).detach().cpu()
+                    ),
                 }
             )
 

@@ -6804,3 +6804,231 @@ C / C_best_known -> 0.95
 ```
 
 这才是和 Google/GW/classical baseline 对齐的目标。
+
+### 18.29 24h MaxCut-3 V14 持续探索协议
+
+本节记录新的长时间任务执行方式：以后再说“连续探索 15h/24h”，含义不是启动一个固定脚本闷跑到结束，而是执行一个循环研究流程。
+
+```text
+提出一个小改进假设
+-> 用 10 分钟到数小时的小实验验证
+-> 记录指标、图、结论
+-> 根据结果提出下一轮改进
+-> 继续验证
+```
+
+每一轮都必须留下可复盘材料：
+
+```text
+实验问题：random 3-regular MaxCut
+图规模：n, degree, seed
+优化能量：E_QUBO(p) = -C(p)
+主指标：C/W
+正式对标指标：C/C* 或 C/C_best_known
+读出方式：direct rounding + 1-bit greedy, sample + 1-bit greedy
+对照：multi-start greedy, low-rank GW-style rounding, MILP best-known/upper bound
+```
+
+#### 18.29.1 当前 V14-Z-Phase 代码主线
+
+当前代码化路线在：
+
+```text
+scripts/run_maxcut3_phase_aware_probe.py
+scripts/run_maxcut3_v14_research_loop.py
+scripts/compute_maxcut3_baselines.py
+```
+
+V14 的核心仍然保持 Z-basis MaxCut：
+
+```text
+C(p) = sum_(i,j in E) w_ij * (p_i + p_j - 2 p_i p_j)
+E_QUBO(p) = -C(p)
+```
+
+相位信息只作为隐藏关系通道：
+
+```text
+RZ phase memory
+neighbor XY phase torque
+phase-difference signal
+late phase-to-Z collapse
+small bounded final pre-measurement rotation
+```
+
+明确不作为当前主线：
+
+```text
+node gate
+full vector loss
+teacher guidance
+deterministic rounding loss
+large non-Z readout
+```
+
+#### 18.29.2 新增的对照基线
+
+新增 `compute_maxcut3_baselines.py`，用于生成：
+
+```text
+random + 1-bit greedy
+low-rank GW-style vector relaxation + hyperplane rounding + 1-bit greedy
+optional MILP incumbent / gap / dual bound
+```
+
+注意：当前 low-rank GW-style 不是严格 SDP-GW，只是和 GW 思路一致的低秩向量松弛近似。严格 GW 需要 SDP 求解器；在没有 SDP solver 的情况下，报告必须写成 `GW-style`，不能写成 certified GW。
+
+一次快速 n=512, seed=42 冒烟对照结果：
+
+```text
+random + 1-bit greedy C/W              = 0.873698
+low-rank GW-style + 1-bit greedy C/W  = 0.917969
+MILP 20s incumbent C/W                = 0.886719
+MILP gap                              ~= 0.0910
+```
+
+该结果只用于验证工具链，不是最终 baseline。
+
+#### 18.29.3 24h 循环输出目录
+
+正式循环默认输出：
+
+```text
+outputs/maxcut3_v14_24h_research/
+```
+
+每轮持续更新：
+
+```text
+summary.csv
+iteration_summary.csv
+research_log.md
+latest_report.md
+final_report.json
+iteration_progress.png
+top_methods.png
+baselines/baseline_report.md
+baselines/baseline_comparison.png
+```
+
+`iteration_progress.png` 必须同时画出：
+
+```text
+SQNN direct rounding + 1-bit greedy
+SQNN sample + 1-bit greedy
+cumulative best
+random + greedy baseline
+low-rank GW-style baseline
+0.90 target
+0.95 stretch target
+```
+
+当前短期目标：
+
+```text
+direct rounding + 1-bit greedy: C/W > 0.90
+```
+
+中期目标：
+
+```text
+direct rounding + 1-bit greedy: C/W -> 0.95
+并同步报告 C/C_best_known 或 C/C*
+```
+
+#### 18.29.4 Chunked 探索记录：V14-Z-Phase on n=512 seed=42
+
+由于当前 Codex shell 环境会在工具调用结束后清理后台 Python 进程，24h 探索在本环境中采用 chunked protocol：
+
+```text
+前台运行一个有限 chunk
+-> 读取结果
+-> 更新提案器和计划书
+-> 再运行下一 chunk
+```
+
+当前主输出目录：
+
+```text
+outputs/maxcut3_v14_24h_research_chunked2/
+```
+
+对照 baseline：
+
+```text
+low-rank GW-style + hyperplane rounding + 1-bit greedy:
+  C/W = 0.917969
+
+random + 1-bit greedy:
+  C/W = 0.873698
+```
+
+注意：该 GW-style 仍不是 certified SDP-GW，只是当前可用的低秩向量松弛对照。
+
+已完成的主要探索：
+
+```text
+1. V14 初筛：
+   best direct+1-bit greedy = 0.891927
+   best sample+1-bit greedy = 0.898438
+
+2. memory_xy_feedback + small final rotation:
+   best direct+1-bit greedy = 0.894531
+   best sample+1-bit greedy = 0.897135
+
+3. memory_xy_feedback + neighbor_xy + collapse + small final rotation:
+   best direct+1-bit greedy = 0.895833
+   best sample+1-bit greedy = 0.897135
+   best expected C/W ~= 0.892460
+
+4. 8192-sample readout rescore:
+   best sample+1-bit greedy = 0.899740
+
+5. deeper direct readout check:
+   greedy passes 240 -> 512 -> 1000 没有提升；
+   当前 direct+greedy 不是因为 greedy pass limit 被截断。
+```
+
+已经验证但没有继续提升的方向：
+
+```text
+symmetry_seed sweep
+symmetry_strength 0.15 / 0.20
+xy_feedback_init up/down
+phase_memory_decay 0.65 / 0.92
+collapse_init 0.015 / 0.060
+final_rotation_max 0.02 / 0.08 / 0.12
+500 rounds / 220 epochs longer training
+cavity / non-backtracking XY message
+```
+
+当前结论：
+
+```text
+纯 V14-Z-Phase 在 random 3-regular MaxCut, n=512, seed=42 上
+direct rounding + 1-bit greedy 暂时平台约为 C/W = 0.895833。
+
+采样读出能到 C/W = 0.899740，说明概率分布中已经含有接近 0.90 的好解；
+但 deterministic direct readout 还没有稳定跨过 0.90。
+
+相对当前 low-rank GW-style baseline 0.917969，V14 仍有明显差距。
+```
+
+下一轮如果继续冲击 0.90 / 0.95，应优先考虑真正增加表达能力，而不是继续局部扫参：
+
+```text
+1. multi-head phase channels:
+   多个隐藏相位头共享少量全局参数，最终仍然 Z-basis 读出。
+
+2. directed-edge/cavity message state:
+   引入 O(E) 非训练 hidden message，而不是 O(n) trainable node gate，
+   更像 BP / non-backtracking message passing。
+
+3. readout-aligned but clean objective:
+   不加入 teacher，不加入 deterministic rounding loss；
+   只考虑是否需要更合理的 late-stage entropy annealing 或 confidence sharpening。
+
+4. benchmark alignment:
+   继续保留 C/W 快速指标；
+   每个关键结果同步保存 C/C_best_known，对齐 GW / Google QAOA 的正式写法。
+```

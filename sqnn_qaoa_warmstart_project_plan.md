@@ -7777,3 +7777,167 @@ seed=99:
    - failure-mode analysis：对 seed=7/23 看是否过早高置信锁错；
    - 用早期 trace 指标预测该走 gain=1.4、1.8，还是更保守路线。
 ```
+
+#### 18.29.13 Per-instance Z-edge gain calibration
+
+为了验证 `z_message_gain=1.4` 是否只是适合 seed=42，而不是随机 3-regular MaxCut 的稳定最优值，
+本轮对 seed=7 和 seed=23 额外扫描：
+
+```text
+gain = 0.6, 1.0, 1.2, 1.8, 2.0
+n = 512
+graph = random 3-regular MaxCut
+rounds = 260
+epochs = 115
+readout = direct rounding + 1-bit greedy, 256-sample + 1-bit greedy
+rescore = top-k 8192-sample + 1-bit greedy
+```
+
+输出位置：
+
+```text
+outputs/maxcut3_v14_z_edge_gain_calibration_seed7/
+outputs/maxcut3_v14_z_edge_gain_calibration_seed23/
+outputs/maxcut3_v14_z_edge_gain_calibration_seed7_rescore_8192/
+outputs/maxcut3_v14_z_edge_gain_calibration_seed23_rescore_8192/
+outputs/maxcut3_v14_gain_calibration_seed7_seed23/
+```
+
+可视化：
+
+```text
+outputs/maxcut3_v14_gain_calibration_seed7_seed23/maxcut3_gain_calibration.png
+outputs/maxcut3_v14_gain_calibration_seed7_seed23/maxcut3_gain_calibration.md
+```
+
+结果：
+
+```text
+seed=7:
+  original gain=1.4 direct + 1-bit greedy C/W = 0.872396
+  best calibrated direct + 1-bit greedy C/W = 0.882812  (gain=1.2)
+  best calibrated 256-sample + 1-bit greedy C/W = 0.888021  (gain=1.8)
+  best calibrated 8192-sample + 1-bit greedy C/W = 0.894531  (gain=1.2)
+  GW-style + 1-bit greedy C/W = 0.915365
+
+seed=23:
+  original gain=1.4 direct + 1-bit greedy C/W = 0.881510
+  best calibrated direct + 1-bit greedy C/W = 0.889323  (gain=1.2)
+  best calibrated 256-sample + 1-bit greedy C/W = 0.894531  (gain=1.2)
+  best calibrated 8192-sample + 1-bit greedy C/W = 0.897135  (gain=1.2)
+  GW-style + 1-bit greedy C/W = 0.916667
+```
+
+阶段性判断：
+
+```text
+1. per-instance gain calibration 是有效的。
+   seed=7 direct 提升 0.010416，seed=23 direct 提升 0.007813。
+
+2. 对弱 seed，gain=1.2 比 gain=1.4 更稳。
+   这说明当前 Z-edge message 过强时可能过早把概率推到错误 cut block。
+
+3. 但 calibration 仍没有补上 GW gap。
+   seed=7 的 8192-sample 最好值 0.894531，距离 GW-style 仍差约 0.020833；
+   seed=23 的 8192-sample 最好值 0.897135，距离 GW-style 仍差约 0.019531。
+
+4. 因此瓶颈不是简单 readout 或 sample 数不足，
+   而是 SQNN 概率分布本身没有稳定表达 GW-style 那种全局相关结构。
+```
+
+#### 18.29.14 Symmetry restart probe
+
+在 seed=7、gain=1.2 的当前最佳 calibrated 配置上，测试多组 `symmetry_seed`：
+
+```text
+default symmetry_seed = 1761
+restart symmetry_seed = 7011, 7023, 7037
+```
+
+输出位置：
+
+```text
+outputs/maxcut3_v14_symmetry_restarts_seed7_gain12/
+outputs/maxcut3_v14_symmetry_restarts_seed7_gain12_review/
+```
+
+可视化：
+
+```text
+outputs/maxcut3_v14_symmetry_restarts_seed7_gain12_review/maxcut3_symmetry_restarts.png
+outputs/maxcut3_v14_symmetry_restarts_seed7_gain12_review/maxcut3_symmetry_restarts.md
+```
+
+结果：
+
+```text
+default:
+  direct + 1-bit greedy C/W = 0.882812
+  256-sample + 1-bit greedy C/W = 0.886719
+  8192-sample + 1-bit greedy C/W = 0.894531
+
+restart-7011:
+  direct + 1-bit greedy C/W = 0.877604
+  256-sample + 1-bit greedy C/W = 0.880208
+
+restart-7023:
+  direct + 1-bit greedy C/W = 0.877604
+  256-sample + 1-bit greedy C/W = 0.882812
+
+restart-7037:
+  direct + 1-bit greedy C/W = 0.877604
+  256-sample + 1-bit greedy C/W = 0.878906
+
+baseline:
+  random + 1-bit greedy C/W = 0.875000
+  GW-style + 1-bit greedy C/W = 0.915365
+```
+
+阶段性判断：
+
+```text
+1. naive symmetry restarts 暂时不是主线。
+   三个 restart 都没有超过 default，direct 都停在 0.877604。
+
+2. 这个结果说明 seed=7 的失败更像模型表达和更新规则问题，
+   不是简单换一个初始破对称方向就能解决。
+
+3. 下一步不应继续大量堆随机 restart。
+   更值得做的是改 Z 相位边消息，让相邻变量的相关信息在更新中表达得更强、更稳。
+```
+
+#### 18.29.15 下一轮模型改进方向
+
+当前目标保持不变：
+
+```text
+task = unweighted random 3-regular MaxCut
+quality metric = C/W, where C is the cut value and W=|E| for unweighted graphs
+near-term target = stable direct + 1-bit greedy C/W >= 0.90
+main target = approach GW-style + 1-bit greedy, about 0.915 to 0.926 on current n=512 seeds
+long-term target = C/C* or C/C_best_known after exact or best-known values are introduced
+```
+
+基于本轮结果，下一轮优先探索：
+
+```text
+1. adaptive Z-edge gain:
+   不再固定一个全局 gain，而是让 gain 随训练轮次或早期 trace 指标调节。
+   目标是避免弱 seed 上过早锁错，同时保留 seed=42 那种强推高置信的收益。
+
+2. block-aware / cavity-aware edge message:
+   当前 Z-edge message 主要是局部边信号。
+   需要让消息更像“一个点收到邻居群体的相位压力”，而不是单纯逐边推概率。
+
+3. late confidence damping:
+   当某个变量已经高度确定，但它周围的边仍然冲突时，降低它继续极化的速度。
+   目标是减少错误 block 被过早固化。
+
+4. early diagnostic selector:
+   用前 40 到 80 轮的 expected C/W、J<0 fraction、mean confidence、probability std
+   预测该实例应该使用 gain=1.2、1.4、1.8，还是更保守的 schedule。
+
+5. 继续保留 GW-style baseline:
+   每个主实验都应同时报告 SQNN direct、SQNN sample、random+greedy、GW-style，
+   避免只看单 seed 或只看 C/W 的局部提升。
+```

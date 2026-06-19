@@ -1551,6 +1551,7 @@ def main():
     parser.add_argument("--n", type=int, default=0)
     parser.add_argument("--average-degree", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--symmetry-seed", type=int, default=None)
     parser.add_argument("--only-phase", action="append", default=[])
     parser.add_argument("--max-runs", type=int, default=0)
     parser.add_argument("--resume", action="store_true")
@@ -1569,6 +1570,8 @@ def main():
     if args.seed is not None:
         base["seed"] = int(args.seed)
         base["symmetry_seed"] = int(args.seed) * 249 + 18
+    if args.symmetry_seed is not None:
+        base["symmetry_seed"] = int(args.symmetry_seed)
     variants = build_variants(base, args.rounds, args.epochs)
     if args.only_phase:
         wanted = set(args.only_phase)

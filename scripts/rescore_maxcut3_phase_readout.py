@@ -19,7 +19,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from explore_j_regularized_sqnn import load_summary, make_train_args  # noqa: E402
 from quantum.warmstart import greedy_local_search, sample_bernoulli  # noqa: E402
-from run_maxcut3_phase_aware_probe import MultiHeadPhaseAwareSQNN, PhaseAwareJRegularizedSQNN  # noqa: E402
+from quantum.warmstart.phase_aware_sqnn import MultiHeadPhaseAwareSQNN, PhaseAwareJRegularizedSQNN  # noqa: E402
 from run_qubo_warmstart import make_benchmark, ratio_value  # noqa: E402
 
 

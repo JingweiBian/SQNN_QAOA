@@ -2,6 +2,7 @@
 outputs/
 article/
 articles/
+sqnnqaoa/
 .matplotlib/
 
 __pycache__/
@@ -23,6 +24,15 @@ tmp/
 *.pth
 *.ckpt
 *.onnx
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.parquet
+*.zip
+*.tar
+*.tar.gz
+*.7z
 
 .ipynb_checkpoints/
 .DS_Store

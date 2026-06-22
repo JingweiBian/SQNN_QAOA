@@ -123,7 +123,6 @@ def low_rank_gw_style_baseline(
     lr,
     restarts,
     hyperplanes,
-    greedy_passes,
     seed,
     log_every=0,
 ):
@@ -175,28 +174,17 @@ def low_rank_gw_style_baseline(
         directions = torch.randn(batch, int(rank), device=device, dtype=dtype, generator=generator)
         directions = F.normalize(directions, dim=-1, eps=1e-8)
         assignments = ((best_vectors @ directions.t()).t() >= 0.0).to(dtype=dtype)
-        if int(greedy_passes) > 0:
-            assignment, _, _ = batch_greedy_local_search(
-                benchmark.problem,
-                assignments,
-                max_passes=int(greedy_passes),
-            )
-            cut = cut_float(benchmark, assignment)
-            if cut > best_cut:
-                best_cut = cut
-                best_assignment = assignment
-        else:
-            cuts = benchmark.cut_value(assignments)
-            index = torch.argmax(cuts)
-            cut = float(cuts[index].detach().cpu())
-            if cut > best_cut:
-                best_cut = cut
-                best_assignment = assignments[index].detach().clone()
+        cuts = benchmark.cut_value(assignments)
+        index = torch.argmax(cuts)
+        cut = float(cuts[index].detach().cpu())
+        if cut > best_cut:
+            best_cut = cut
+            best_assignment = assignments[index].detach().clone()
         done += batch
 
     seconds = time.perf_counter() - start_time
     return result_from_assignment(
-        "low_rank_gw_style_plus_1bit_greedy",
+        "low_rank_gw_style_sampled_best",
         benchmark,
         best_assignment,
         seconds,
@@ -205,7 +193,6 @@ def low_rank_gw_style_baseline(
         lr=float(lr),
         restarts=int(restarts),
         hyperplanes=int(hyperplanes),
-        greedy_passes=int(greedy_passes),
         relaxed_cut=float(best_relaxed_cut.detach().cpu()),
         relaxed_cut_fraction=float((best_relaxed_cut / total_weight).detach().cpu()),
         history=history,
@@ -423,7 +410,6 @@ def main():
     parser.add_argument("--gw-lr", type=float, default=0.04)
     parser.add_argument("--gw-restarts", type=int, default=2)
     parser.add_argument("--gw-hyperplanes", type=int, default=512)
-    parser.add_argument("--gw-greedy-passes", type=int, default=260)
     parser.add_argument("--milp-time-limit", type=float, default=0.0)
     parser.add_argument("--milp-rel-gap", type=float, default=0.0)
     args = parser.parse_args()
@@ -456,7 +442,6 @@ def main():
             lr=float(args.gw_lr),
             restarts=int(args.gw_restarts),
             hyperplanes=int(args.gw_hyperplanes),
-            greedy_passes=int(args.gw_greedy_passes),
             seed=int(args.seed) + 29,
             log_every=max(int(args.gw_steps) // 10, 0),
         ),

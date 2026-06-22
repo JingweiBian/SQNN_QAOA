@@ -8,6 +8,13 @@ The package keeps the reusable SQNN framework:
 - `training/`: original classification trainer.
 - `warmstart/`: sparse QUBO modeling and SQNN warm-start utilities for QAOA.
 
+Current reusable warm-start model files:
+
+- `warmstart/phase_aware_sqnn.py`: current MaxCut V14 / Clean-ZEdge
+  phase-aware J-regularized SQNN, including the multi-head symmetry ensemble.
+- `warmstart/qubo_sqnn.py`: earlier reusable QUBO warm-start SQNN family,
+  including synchronous local-field variants.
+
 Compatibility wrappers remain for the general SQNN paths, such as
 `quantum.layers`, `quantum.group_encoder`, `quantum.networkmodels`, and
 `quantum.trainer`.

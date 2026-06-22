@@ -14,7 +14,6 @@ Across seeds `7, 11, 23, 42, 99`:
 direct+1-bit greedy mean C/W        = 0.897135
 Bernoulli sample+1-bit greedy mean  = 0.898958
 Bloch hyperplane+1-bit greedy mean  = 0.902604
-GW-style+1-bit greedy mean          = 0.917448
 ```
 
 Best per-seed Bloch hyperplane readout:

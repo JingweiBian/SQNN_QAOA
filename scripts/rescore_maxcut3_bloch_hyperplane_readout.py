@@ -22,7 +22,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from explore_j_regularized_sqnn import make_train_args  # noqa: E402
 from quantum.warmstart import batch_greedy_local_search  # noqa: E402
-from run_maxcut3_phase_aware_probe import (  # noqa: E402
+from quantum.warmstart.phase_aware_sqnn import (  # noqa: E402
     MultiHeadPhaseAwareSQNN,
     PhaseAwareJRegularizedSQNN,
 )

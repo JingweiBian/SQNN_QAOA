@@ -1,0 +1,845 @@
+# SQNN-QAOA Warm-Start Project Plan
+
+本文是当前项目的规范主计划。旧版计划书里大量逐轮日志、路线名和临时实验记录已经不再放在主计划里；历史细节以 Git 历史、独立报告和 `outputs/*/report.md` 为准。
+
+当前项目聚焦：
+
+```text
+主问题：random 3-regular MaxCut
+当前规模：n=512 为主验证集，n=1024 为规模检查
+长期目标：构造可解释、可扩展、有量子/QAOA warm-start 意义的 SQNN 模型
+近期目标：稳定接近或超过论文口径 GW expected baseline
+```
+
+代码归属规范：
+
+```text
+quantum/
+  正规、可复用的量子/SQNN/QAOA 模型与算法。
+
+quantum/warmstart/phase_aware_sqnn.py
+  当前 MaxCut 主线 V14 / Clean-ZEdge 使用的 PhaseAwareJRegularizedSQNN
+  与 MultiHeadPhaseAwareSQNN。
+
+quantum/warmstart/qubo_sqnn.py
+  早期可复用 QUBO warm-start SQNN 家族，包括 V10/V11 同步局域场路线。
+
+classical/
+  CP-SAT、GW-style、random+greedy、指标计算、对比驱动脚本。
+  这里可以调用 quantum/ 里的 SQNN 做对比，但不再定义量子模型类。
+
+scripts/
+  临时探索、批量实验、rescore、报告生成入口。
+  不再把主线量子模型定义在 scripts/ 里。
+
+历史例外：
+  scripts/explore_j_regularized_sqnn.py 仍保留 V12/V13 的
+  JRegularizedSyncLocalSQNN，用于复现实验和给旧脚本提供训练工具；
+  它不是当前 Clean-ZEdge 主线。若 V13 路线重新成为主线，再迁入 quantum/。
+```
+
+---
+
+## 1. 当前主线
+
+### 1.1 任务选择
+
+当前先聚焦无权随机 3-正则图 MaxCut：
+
+```text
+G = (V, E)
+n = |V|
+degree = 3
+W = sum_{(i,j) in E} w_ij
+无权 random 3-regular 时，w_ij = 1, W = |E| = 3n/2
+```
+
+选择这个任务的原因：
+
+```text
+1. 它和 QAOA / Google MaxCut-3 文献直接相关；
+2. 有清晰 classical baseline：GW expected、GW sampled、CP-SAT / SDP upper bound；
+3. 随机 3-正则图足够标准，方便与主流论文对齐；
+4. 它比 planted parity 更接近我们最终想做的 QAOA warm-start 场景。
+```
+
+暂时封存但不删除的方向：
+
+```text
+noisy planted parity
+weighted signed graph frustration
+LDPC syndrome decoding QUBO
+random Max-kXOR
+```
+
+这些方向后续可以作为现实任务扩展，但当前不和 MaxCut 主线混跑。
+
+### 1.2 当前推荐模型
+
+当前推荐从外部 `sqnnqaoa/` 快照吸收来的 clean route 作为下一轮主线：
+
+```text
+name: Clean-ZEdge
+
+核心结构：
+  short local-field memory
+  random RZ+RY symmetry breaking
+  directed z-edge anti-correlation message
+  late collapse into RY
+  stronger z-edge gain schedule
+
+已删除：
+  full-time XY feedback
+
+记录规则：
+  Clean-ZEdge 主线不再展示已删除机制的关闭值；
+  文档只记录 full-time XY feedback removed。
+```
+
+核心判断：
+
+```text
+1. 十图扫描已经验证：全时 XY feedback 没有稳定收益，当前主线删除它；
+2. short phase memory + directed z-edge anti-correlation + late collapse 更干净；
+3. 当前收益主要体现在最终 bitstring readout，而不是 expected probability cut；
+4. 后续要验证 Clean-ZEdge 是否也能提升 Bloch hyperplane readout。
+```
+
+外部十图扫描结果：
+
+```text
+n = 512, degree = 3, seeds = 0..9
+baseline = GW expected hyperplane cut
+
+Clean-ZEdge:
+  direct gap mean = +0.009560, wins 9/10
+  sample gap mean = +0.007216, wins 8/10
+  expected gap    = -0.008419
+  directgreedy gap = +0.014508
+```
+
+这表示 Clean-ZEdge 的 `C_d` 和 `C_s` 已经能超过论文口径 `GW expected`，但 `C[p]` 还没有超过。
+
+### 1.3 旧主线的定位
+
+旧 V14-XY route：
+
+```text
+V14-XY = full-time XY feedback + z-edge cavity + late collapse
+```
+
+现在降级为对照路线，不再作为默认主线。它仍然有参考价值，特别是：
+
+```text
+1. 分析 RZ/XY 相位通道；
+2. 作为已降级对照，解释为什么主线删除 full-time XY feedback；
+3. 复查 Bloch hyperplane readout 的隐藏向量质量。
+```
+
+---
+
+## 2. 问题定义与能量函数
+
+### 2.1 MaxCut 标准目标
+
+令二值变量：
+
+```text
+x_i in {0, 1}
+s_i = 1 - 2 x_i in {+1, -1}
+```
+
+MaxCut cut value：
+
+```text
+C(x) = sum_{(i,j) in E} w_ij * 1[x_i != x_j]
+     = 1/2 * sum_{(i,j) in E} w_ij * (1 - s_i s_j)
+```
+
+项目中的 QUBO energy 使用：
+
+```text
+E_QUBO(x) = -C(x)
+```
+
+所以优化 MaxCut 等价于最小化 `E_QUBO`。
+
+### 2.2 概率态的 expected cut
+
+SQNN 输出每个变量的概率：
+
+```text
+p_i = P(x_i = 1)
+```
+
+若按独立 Bernoulli 分布近似，则边 `(i,j)` 被割开的概率为：
+
+```text
+P[x_i != x_j] = p_i (1 - p_j) + (1 - p_i) p_j
+              = p_i + p_j - 2 p_i p_j
+```
+
+因此：
+
+```text
+C[p] = sum_{(i,j) in E} w_ij * (p_i + p_j - 2 p_i p_j)
+E[p] = -C[p]
+```
+
+训练时的主优化目标仍然是 Z-basis / product-distribution expected MaxCut，而不是直接优化一个外部 teacher 或完整向量损失。
+
+---
+
+## 3. SQNN 模型表达
+
+### 3.1 Bloch 状态与 Z 基读出
+
+每个 MaxCut 变量对应一个 Bloch 向量：
+
+```text
+r_i = (X_i, Y_i, Z_i)
+```
+
+最终读出只使用 Z 基：
+
+```text
+p_i = P(x_i = 1) = (1 - Z_i) / 2
+```
+
+这点必须保持清楚：
+
+```text
+Z 决定最终概率；
+RZ 主要改变 X/Y 相位，不直接改变 p_i；
+RY 会把相位信息折回 Z，从而改变 p_i。
+```
+
+### 3.2 一轮 SQNN 更新
+
+每轮更新大致分为：
+
+```text
+1. 从当前 p 计算 local field F_i；
+2. 用 local-field memory 形成 RZ 相位信号；
+3. 用 z-edge cavity message 表达相邻节点反相关；
+4. 先做 RZ，相位在 X/Y 平面积累；
+5. 再做 RY，把 local field 和 relation_signal 折回 Z；
+6. 用 J_i 检查更新方向；
+7. 可选 monotone accept / trust region。
+```
+
+其中 `z-edge cavity` 的含义：
+
+```text
+每条无向边 (i,j) 拆成 i -> j 和 j -> i 两条有向消息；
+i -> j 根据 i 当前 Z belief 给 j 一个反向 cut 建议；
+更新时尽量避免 j -> i 直接回流，形成 non-backtracking / cavity 效果。
+```
+
+### 3.3 J 方向约束
+
+局部场：
+
+```text
+F_i = d E[p] / d p_i 的局部近似方向
+```
+
+每轮概率变化：
+
+```text
+Delta p_i = p_i(new) - p_i(old)
+```
+
+定义：
+
+```text
+J_i = -F_i * Delta p_i
+```
+
+解释：
+
+```text
+J_i > 0:
+  该变量更新大体朝降低 QUBO energy / 增大 cut 的方向走。
+
+J_i < 0:
+  该变量更新在局部场意义下方向可疑。
+```
+
+J penalty：
+
+```text
+J_penalty = mean_i ReLU(-J_i)
+```
+
+其中：
+
+```text
+ReLU(a) = max(a, 0)
+```
+
+所以 `ReLU(-J_i)` 只惩罚 `J_i < 0` 的部分。
+
+---
+
+## 4. 指标规范
+
+这是后续所有报告最重要的命名规则。
+
+### 4.1 基本量
+
+```text
+C_value:
+  某个 bitstring 的原始 cut value。
+
+W:
+  total edge weight。
+  无权 random 3-regular 图中 W = |E| = 3n/2。
+
+C_star:
+  真实最优 MaxCut 值。
+
+UB:
+  certified upper bound，例如 SDP_UB、CP-SAT upper bound、MILP dual bound。
+
+C_best_known:
+  当前已知最好的离散 cut value。
+```
+
+### 4.2 C/W
+
+```text
+C_over_W = C_value / W
+```
+
+含义：
+
+```text
+cut fraction，割比例。
+它表示总边权里被切掉多少比例。
+```
+
+注意：
+
+```text
+C/W 不是严格 approximation ratio。
+历史代码中很多 `ratio` 字段在 MaxCut-3 上实际都是 C/W。
+以后报告必须写成 C_over_W 或 cut fraction。
+```
+
+### 4.3 C/C*
+
+```text
+C_over_Cstar = C_value / C_star
+```
+
+含义：
+
+```text
+strict approximation ratio。
+```
+
+使用条件：
+
+```text
+只有 exact solver 证明 OPTIMAL，或者该图最优值已知时，才能报告 C/C*。
+```
+
+如果 CP-SAT 只给出 FEASIBLE，不能把 incumbent 当成 `C_star`。
+
+### 4.4 C/UB
+
+```text
+C_over_UB = C_value / UB
+```
+
+含义：
+
+```text
+相对 certified upper bound 的保守近似比下界。
+```
+
+因为：
+
+```text
+C_star <= UB
+```
+
+所以：
+
+```text
+C_value / UB <= C_value / C_star
+```
+
+也就是说 `C/UB` 不会虚高，是保守的。
+
+### 4.5 C/C_best_known
+
+```text
+C_over_best_known = C_value / C_best_known
+```
+
+含义：
+
+```text
+相对当前最好已知离散解的分数。
+```
+
+注意：
+
+```text
+如果 C_best_known 还没有被证明等于 C_star，
+则 C/C_best_known 不能叫 strict approximation ratio。
+```
+
+### 4.6 GW expected
+
+论文口径 GW baseline 指：
+
+```text
+GW expected = E_hyperplane[C_GW]
+            = sum_{(i,j) in E} arccos(v_i dot v_j) / pi
+```
+
+其中 `v_i` 是 GW / SDP-style vector relaxation 的单位向量。
+
+注意：
+
+```text
+GW expected 是随机超平面 rounding 的期望 cut value；
+它不是 sampled-best；
+它也不是 local-search 后处理结果。
+```
+
+### 4.7 推荐报告字段
+
+每个主实验至少保存：
+
+```text
+graph_id
+n
+degree
+seed
+W
+C_star              if exact
+UB                  if available
+C_best_known
+
+SQNN_expected_C
+SQNN_direct_C
+SQNN_directgreedy_C
+SQNN_sample_C
+SQNN_bloch_C        if used
+
+GW_expected_C
+GW_sampled_best_C   if used
+
+*_C_over_W
+*_C_over_Cstar      only if exact
+*_C_over_UB         if UB available
+*_C_over_best_known if useful
+```
+
+---
+
+## 5. SQNN 读出口径
+
+### 5.1 SQNN expected
+
+```text
+C_p = C[p]
+```
+
+含义：
+
+```text
+概率分布本身的 expected cut；
+不产生 bitstring；
+不采样；
+不接 greedy。
+```
+
+这是判断“概率分布本体是否强”的指标。
+
+### 5.2 SQNN direct
+
+```text
+x_d,i = 1[p_i >= 0.5]
+C_d   = C(x_d)
+```
+
+含义：
+
+```text
+最干净的 deterministic Z-basis readout。
+当前主模型质量优先看 C_d。
+```
+
+### 5.3 SQNN directgreedy
+
+```text
+x_dg = 1-bit-greedy-local-search(x_d)
+C_dg = C(x_dg)
+```
+
+1-bit greedy local search：
+
+```text
+重复寻找一个单 bit flip；
+如果翻转它能提高 cut，就执行当前最优正增益 flip；
+直到没有任何单 bit flip 能提高 cut。
+```
+
+含义：
+
+```text
+C_dg 反映 SQNN 给出的初始点 + 经典局部修复的工程效果。
+它不能单独代表 SQNN 概率态本体。
+```
+
+### 5.4 SQNN sample
+
+```text
+x_s^(k) ~ product_i Bernoulli(p_i), k = 1,...,K
+x_s     = argmax_k C(x_s^(k))
+C_s     = C(x_s)
+```
+
+报告要求：
+
+```text
+必须写明 K，例如 C_s(K=256) 或 C_s(K=8192)。
+如果 sample 后接 greedy，必须写成 C_sg，不能混进 C_s。
+```
+
+### 5.5 Bloch hyperplane readout
+
+用隐藏 Bloch 向量：
+
+```text
+r_i = (X_i, Y_i, Z_i)
+```
+
+做超平面舍入：
+
+```text
+x_i = 1[r_i dot g >= 0]
+```
+
+含义：
+
+```text
+这是 SQNN-generated embedding 的 correlated readout。
+它与 GW 的“向量 + 超平面”机制同构，但向量来自 SQNN 动力学。
+```
+
+注意：
+
+```text
+Bloch hyperplane readout 不是纯 Z-basis direct readout；
+它可以作为诊断和潜在 correlated readout 路线，但报告时必须单独命名。
+```
+
+---
+
+## 6. 经典 Baseline 规范
+
+### 6.1 主 baseline
+
+当前主 baseline：
+
+```text
+GW expected hyperplane cut
+```
+
+实现：
+
+```text
+classical/maxcut3_compare.py
+```
+
+当前代码使用 low-rank Burer-Monteiro style vector relaxation，因此报告时写：
+
+```text
+GW-style expected
+```
+
+不要写成 certified GW，除非接入真正 SDP solver 并保存证书。
+
+### 6.2 辅助 baseline
+
+```text
+Random + 1-bit greedy:
+  用于衡量局部搜索本身强度。
+
+GW sampled-best(K):
+  与 SQNN sample(K) 对齐。
+
+CP-SAT:
+  用于 exact C_star 或 certified UB。
+
+SDP_UB:
+  最理想的上界分母，后续需要接入实例级 SDP solver。
+```
+
+### 6.3 Baseline 对齐规则
+
+```text
+SQNN C_p:
+  对比 GW expected，但要说明一个是 product probability expected，一个是 vector hyperplane expected。
+
+SQNN C_d:
+  对比 GW expected，这是当前最重要的 deterministic readout 对标。
+
+SQNN C_dg:
+  可以对比 GW expected，但必须注明带 1-bit greedy 后处理。
+
+SQNN C_s(K):
+  对比 GW sampled-best(K)，K 要相同或明确写出。
+
+Bloch hyperplane:
+  同时对比 GW expected 和 GW sampled-best(K)。
+```
+
+---
+
+## 7. 当前已知结论
+
+### 7.1 Clean-ZEdge
+
+外部 `sqnnqaoa/` 十图扫描显示：
+
+```text
+n=512, degree=3, seeds=0..9
+baseline = GW expected
+
+Clean-ZEdge:
+  C_d gap mean = +0.009560
+  C_d wins = 9/10
+  C_s gap mean = +0.007216
+  C_s wins = 8/10
+  C_p gap mean = -0.008419
+```
+
+解释：
+
+```text
+1. 最终 bitstring 质量很强；
+2. 概率分布 expected cut 仍未超过 GW expected；
+3. 提升来自更好的读出结构，而不是 C[p] 本身彻底超过 GW。
+```
+
+### 7.2 Bloch hyperplane
+
+本机旧 V14 / mix route 的五 seed 结果：
+
+```text
+direct+greedy mean C/W        = 0.897135
+Bernoulli sample mean C/W     = 0.898958
+Bloch hyperplane mean C/W     = 0.902604
+```
+
+解释：
+
+```text
+1. SQNN 隐藏 Bloch 向量含有独立概率读出没有利用到的相关结构；
+2. Bloch hyperplane 比 Bernoulli sample 更稳定；
+3. 这组旧结果没有按现在的 GW expected / GW sampled-best 规范拆分，需要重新评估。
+```
+
+### 7.3 n=1024 轻量检查
+
+旧 V14 route 在 `n=1024, seed=17`：
+
+```text
+direct+greedy C/W      = 0.888672
+Bernoulli sample C/W   = 0.889323
+Bloch hyperplane C/W   = 0.889974
+```
+
+解释：
+
+```text
+1. n=1024 仍可接近 0.89；
+2. Bloch hyperplane 提升较小；
+3. n=1024 需要用 Clean-ZEdge 重新跑，不能直接沿用旧 V14-XY 结论。
+```
+
+---
+
+## 8. 已封存或降级的路线
+
+以下路线目前不作为主线：
+
+```text
+reset route:
+  已放弃。reset 后近似比变差，不再推进。
+
+full-vector auxiliary loss:
+  直接把 full-vector anti-alignment 放进 loss 会伤害 direct/sample/Bloch readout。
+
+target relation / target-mix:
+  多轮扫描负结果，暂时封存。
+
+full-time XY feedback:
+  降级为对照，不作为 Clean-ZEdge 主线。
+
+learned node gate:
+  参数数量增加明显，收益不稳定，暂缓。
+
+edge_cavity_xy torque directly added to RZ:
+  会破坏 Z-edge collapse，暂时封存。
+
+entropy sharpening:
+  对当前主目标帮助有限，暂缓。
+
+longer optimization / very large J weight:
+  未带来稳定收益，不作为优先方向。
+```
+
+---
+
+## 9. 下一步实验计划
+
+### 9.1 复现规范化 baseline
+
+先安装并验证 classical 工具：
+
+```text
+requirements-warmstart.txt 已加入 ortools
+```
+
+目标：
+
+```text
+1. 运行 CP-SAT / GW-style expected baseline；
+2. 生成统一字段：C/W、C/UB、C/Cstar；
+3. 确认 n=512 seeds=0..9 与外部快照结果一致。
+```
+
+### 9.2 复现 Clean-ZEdge
+
+运行：
+
+```text
+classical/n512_10_random_graphs.py
+model_config = clean_edgeboost_mem060
+seeds = 0..9
+baseline = GW expected only
+```
+
+必须报告：
+
+```text
+C_p
+C_d
+C_dg
+C_s(K)
+GW_expected
+gap_to_GW_expected
+```
+
+### 9.3 Clean-ZEdge + Bloch hyperplane
+
+目标：
+
+```text
+检查 Clean-ZEdge 是否也能提升 hidden Bloch embedding 的 hyperplane readout。
+```
+
+必须同时报告：
+
+```text
+C_d
+C_s(K)
+C_bloch(K)
+GW_expected
+GW_sampled_best(K)
+```
+
+### 9.4 n=1024 scale check
+
+用 Clean-ZEdge 在 n=1024 重新跑：
+
+```text
+n = 1024
+degree = 3
+至少 3 个 seed
+```
+
+目标：
+
+```text
+1. 检查 C_d 是否仍能接近或超过 GW expected；
+2. 检查 Bloch hyperplane 是否还能带来额外收益；
+3. 记录 residual active variables 和 max component。
+```
+
+### 9.5 下一轮模型改进
+
+优先改进方向：
+
+```text
+1. Tune Clean-ZEdge:
+   short-memory strength
+   late-collapse strength
+   z-edge gain schedule
+
+2. Instance-adaptive route selector:
+   用早期 round features 判断当前图适合哪种 gain/collapse schedule。
+
+3. Edge hidden state:
+   把 scalar z-edge message 升级为小共享 edge state，
+   但必须保持参数共享，避免节点级参数爆炸。
+
+4. Probability distribution improvement:
+   如果目标是让 C[p] 也超过 GW expected，需要设计更直接提升 product expected cut 的结构，
+   不能只靠后处理 readout。
+```
+
+---
+
+## 10. 实验记录规范
+
+每次实验必须保存：
+
+```text
+summary.csv
+report.md
+config.json 或等价配置
+关键图 png
+```
+
+报告必须写清：
+
+```text
+1. 任务：
+   random 3-regular MaxCut / n / degree / seed
+
+2. 分母：
+   W / C_star / UB / C_best_known
+
+3. 指标：
+   C_over_W, C_over_Cstar, C_over_UB, C_over_best_known
+
+4. 读出：
+   C_p, C_d, C_dg, C_s(K), C_bloch(K)
+
+5. baseline：
+   GW expected, GW sampled-best(K), random + greedy
+
+6. 后处理：
+   是否使用 1-bit greedy，greedy passes 多少
+
+7. 采样：
+   sample K，hyperplane K
+```
+
+主计划不再记录所有中间失败 sweep。失败路线只在下面两种情况进入主计划：
+
+```text
+1. 它改变了主线判断；
+2. 它足够重要，需要防止未来重复浪费时间。
+```
+
+其余结果放入独立实验报告或 `outputs/*/report.md`。

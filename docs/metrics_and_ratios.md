@@ -142,6 +142,63 @@ GW expected 是随机超平面 rounding 的期望 cut value。
 它也不是 local-search 后处理结果。
 ```
 
+## SQNN Readouts
+
+```text
+SQNN_expected_C = C[p]
+```
+
+含义：
+
+```text
+product Bernoulli 概率分布本体的 expected cut。
+它用于训练和诊断分布形状，但不是当前最终优化目标。
+```
+
+```text
+SQNN_direct_C = C_d = C(1[p_i >= 0.5])
+```
+
+含义：
+
+```text
+Z-basis deterministic direct readout。
+这是当前主线最重要的可物理测量输出。
+```
+
+```text
+SQNN_directgreedy_C = C_dg
+```
+
+含义：
+
+```text
+C_d 后接 1-bit greedy local search。
+它是工程后处理口径，不能混写成纯 SQNN direct readout。
+```
+
+```text
+SQNN_sample_C = C_s(K)
+```
+
+含义：
+
+```text
+从 product Bernoulli(p) 采样 K 次后的最好 cut。
+必须报告 K。
+```
+
+```text
+SQNN_bloch_C = C_bloch(K)
+```
+
+含义：
+
+```text
+隐藏 Bloch 向量的 hyperplane readout。当前主线已封存；
+只在历史复现或专门对照实验中使用，不能作为默认必报指标。
+```
+
 ## Recommended Field Names
 
 主实验至少保存：
@@ -164,7 +221,7 @@ sqnn_expected_C
 sqnn_direct_C
 sqnn_directgreedy_C
 sqnn_sample_C
-sqnn_bloch_C
+sqnn_bloch_C        only for archived/special Bloch hyperplane studies
 ```
 
 baseline 结果：

@@ -771,7 +771,12 @@ def run_one(args, n: int) -> dict:
 
     rounds = int(args.rounds_1024 if int(n) >= 1024 else args.rounds)
     epochs = int(args.epochs_1024 if int(n) >= 1024 else args.epochs)
-    config = best_v14_gain14_config(
+    config_builder = (
+        recommended_clean_edgeboost_config
+        if args.model_config == "clean_edgeboost_mem060"
+        else best_v14_gain14_config
+    )
+    config = config_builder(
         n=n,
         seed=seed,
         rounds=rounds,
@@ -814,6 +819,8 @@ def run_one(args, n: int) -> dict:
         "exact_or_cp_sat": asdict(exact),
         "gw_style_expected": asdict(gw_expected),
         "gw_style_sampled_best": asdict(gw_sampled_best),
+        "sqnn_model_config": str(args.model_config),
+        "sqnn_phase": config.get("phase", ""),
         "sqnn_best_expected": best_expected_row,
         "sqnn_best_direct": best_direct_row,
         "sqnn_best_direct_greedy": best_row,
@@ -960,6 +967,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=110)
     parser.add_argument("--rounds-1024", type=int, default=380)
     parser.add_argument("--epochs-1024", type=int, default=130)
+    parser.add_argument(
+        "--model-config",
+        choices=["clean_edgeboost_mem060", "v14_memory_xy_z_edge_gain14"],
+        default="clean_edgeboost_mem060",
+    )
     parser.add_argument("--head-count", type=int, default=1)
     parser.add_argument("--head-seed-stride", type=int, default=7919)
     return parser.parse_args()

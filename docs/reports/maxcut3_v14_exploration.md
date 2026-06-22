@@ -6,6 +6,12 @@ This report summarizes the current long-run exploration around random 3-regular 
 
 The reported ratios use the current benchmark denominator `W`, so they are cut fractions `C/W`. They are not strict `C/C*` unless an exact optimum is substituted as the denominator.
 
+Status note: this is now an archived exploration report. The current mainline
+prioritizes physically measurable Z-basis deterministic direct readout (`C_d`).
+Bloch hyperplane readout is kept here as a historical diagnostic, but it is
+sealed off from the near-term mainline because it is a post-processing readout
+over fixed hidden vectors and is not directly experiment-friendly.
+
 ## Current Best Picture
 
 Across seeds `7, 11, 23, 42, 99`:
@@ -43,7 +49,11 @@ Bloch hyperplane correlated readout > Bernoulli independent readout > direct rou
 
 This means the hidden Bloch vectors already contain useful correlation information that the scalar probability readout does not fully use.
 
-The closest route to GW is therefore not a larger threshold scan, nor a crude full-vector loss. It is a cleaner SQNN mechanism that makes hidden phase/Bloch vectors more consistently hyperplane-roundable while preserving the Z-basis measurement interpretation.
+Historical conclusion at the time: the closest route to GW looked like a cleaner
+SQNN mechanism that made hidden phase/Bloch vectors more consistently
+hyperplane-roundable while preserving the Z-basis measurement interpretation.
+Current mainline no longer treats this as the near-term route; `C_d` is the main
+physical readout target.
 
 ## Strong Negative Results
 
@@ -78,16 +88,16 @@ Z-basis product expected MaxCut objective
 J penalty retained
 mix025 as weak-seed repair route
 gain14 / sched10to14 / sched08to14 as route candidates
-Bloch XYZ hyperplane readout as correlated diagnostic/readout
+Bloch XYZ hyperplane readout as archived correlated diagnostic/readout
 ```
 
 ## Next Recommended Work
 
-1. Design a measurement-faithful correlated readout story:
-   keep Z-basis probabilities as the primary observable, but explicitly justify using hidden Bloch vectors as SQNN-generated embeddings for hyperplane rounding.
+1. Prioritize Z-basis direct readout:
+   keep `C_d` as the main physical measurement target.
 
 2. Build a cleaner phase-correlation mechanism:
-   do not directly add full-vector loss or raw edge_cavity torque. Instead, try a separate edge phase memory or readout-only embedding head that does not disturb Z collapse.
+   do not directly add full-vector loss, raw edge_cavity torque, or a readout-only hyperplane embedding head. Prefer a shared edge/phase memory that improves the final Z collapse and `C_d`.
 
 3. Improve route selection:
    current best route depends on instance seed. A lightweight instance-adaptive selector or internal adaptive gain mechanism is more promising than a single fixed route.
@@ -96,7 +106,8 @@ Bloch XYZ hyperplane readout as correlated diagnostic/readout
    for small/medium instances, compute or approximate `C*`; for larger instances, compare to best-known classical baselines and GW-style baselines under the same graph distribution.
 
 5. Scale check:
-   rerun the current V14 phase-aware model on n=1024 random 3-regular MaxCut and apply Bloch hyperplane readout, because existing n=1024 outputs are mostly from older/non-V14 routes.
+   rerun the current phase-aware model on n=1024 random 3-regular MaxCut and
+   prioritize direct readout stability.
 
 ## n=1024 Light Scale Check
 
@@ -118,4 +129,4 @@ residual active variables    = 32
 max residual component       = 3
 ```
 
-This is only a scale smoke test. It suggests the V14 route remains viable at n=1024, but the Bloch hyperplane gain is much smaller than the best n=512 cases. The n=1024 setting needs its own route/gain/schedule tuning.
+This is only a scale smoke test. It suggests the V14 route remains viable at n=1024, but the Bloch hyperplane gain is much smaller than the best n=512 cases. The n=1024 setting needs its own route/gain/schedule tuning. Under the current direct-readout mainline, this result is historical context rather than a reason to reopen hyperplane readout as a near-term diagnostic.

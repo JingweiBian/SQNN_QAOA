@@ -126,6 +126,7 @@ GW expected
 SQNN expected 是 product Bernoulli probability expected cut；
 GW expected 是 vector hyperplane expected cut。
 两者都是 expected value，但分布族不同。
+当前主线里 C[p] 是辅助诊断，不是最终优化目标。
 ```
 
 ### SQNN Direct
@@ -141,6 +142,7 @@ GW expected
 ```
 
 这是当前最重要的 deterministic readout 对标。
+它对应 Z-basis deterministic readout，是当前最接近物理实验测量的主指标。
 
 ### SQNN Directgreedy
 
@@ -174,13 +176,13 @@ GW sampled-best(K)
 
 K 必须写清楚。
 
-### Bloch Hyperplane Readout
+### Bloch Hyperplane Readout 已封存
 
 ```text
 C_bloch(K) = best of K hyperplanes over SQNN Bloch vectors
 ```
 
-建议同时对比：
+历史复现实验如需使用，建议同时对比：
 
 ```text
 GW expected
@@ -188,6 +190,14 @@ GW sampled-best(K)
 ```
 
 因为 Bloch hyperplane readout 与 GW 的向量超平面 rounding 机制最接近。
+
+当前主线暂时封存该方向：
+
+```text
+1. 它主要是在固定 SQNN 分布/隐藏向量后寻找更强后处理读出；
+2. 它不是当前优化结果本身的主评价；
+3. 它的物理实验实现路径不直接。
+```
 
 ## Current Clean Baseline Protocol
 
@@ -210,6 +220,9 @@ SQNN directgreedy C/W
 SQNN sample C/W
 gap to GW expected
 ```
+
+其中 `SQNN direct C/W` 是主指标；`SQNN expected`、`directgreedy` 和
+`sample` 是辅助诊断或工程对照。
 
 正式论文式比较再补：
 

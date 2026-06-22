@@ -1,4 +1,4 @@
-# SQNN-QAOA Warm-Start Project Plan
+# SQNN-QAOA Direct-Readout Project Plan
 
 本文是当前项目的规范主计划。旧版计划书里大量逐轮日志、路线名和临时实验记录已经不再放在主计划里；历史细节以 Git 历史、独立报告和 `outputs/*/report.md` 为准。
 
@@ -7,8 +7,17 @@
 ```text
 主问题：random 3-regular MaxCut
 当前规模：n=512 为主验证集，n=1024 为规模检查
-长期目标：构造可解释、可扩展、有量子/QAOA warm-start 意义的 SQNN 模型
-近期目标：稳定接近或超过论文口径 GW expected baseline
+长期目标：构造可解释、可扩展、物理可实验测量的 SQNN-QAOA 组合优化模型
+近期目标：用 Z-basis deterministic direct readout 稳定接近或超过论文口径 GW expected baseline
+```
+
+定位说明：
+
+```text
+当前主线不是“先生成 warm-start，再把主要优化交给 QAOA/贪心”的流程。
+历史代码和目录仍保留 warmstart 命名，但模型定位已经转为：
+用 SQNN 自身的 cost/mixer-like 交替动力学直接产生高质量 Z-basis bitstring。
+QAOA 提供的是 cost/mixer 交替结构的物理启发，而不是当前主线的后续求解器。
 ```
 
 代码归属规范：
@@ -23,6 +32,7 @@ quantum/warmstart/phase_aware_sqnn.py
 
 quantum/warmstart/qubo_sqnn.py
   早期可复用 QUBO warm-start SQNN 家族，包括 V10/V11 同步局域场路线。
+  目录名保留历史命名；当前主线不再把 warm-start 作为模型定位。
 
 classical/
   CP-SAT、GW-style、random+greedy、指标计算、对比驱动脚本。
@@ -36,6 +46,61 @@ scripts/
   scripts/explore_j_regularized_sqnn.py 仍保留 V12/V13 的
   JRegularizedSyncLocalSQNN，用于复现实验和给旧脚本提供训练工具；
   它不是当前 Clean-ZEdge 主线。若 V13 路线重新成为主线，再迁入 quantum/。
+```
+
+---
+
+## 0. 模型发展脉络
+
+如果只数“真正改变结构假设”的代表性模型，当前项目可以按 7 个阶段理解：
+
+```text
+Early graph warm-start SQNN:
+  QUBOWarmStartSQNN / QUBOInstanceEmbeddingWarmStartSQNN /
+  QUBOHybridWarmStartSQNN / QUBOQuantumDataWarmStartSQNN。
+  这一阶段主要验证 sparse QUBO + message passing + probability readout
+  能否给 QAOA 或经典后处理提供 warm-start。
+
+V10 / 基础版 sync-local:
+  QUBOSynchronousLocalFieldSQNN。
+  这是后续路线的基础版：一变量一 Bloch 向量，从 |+> 出发；
+  每轮用旧 p 计算 QUBO local field，先 RZ 写相位，再 RY 改 Z-basis 概率；
+  可用 monotone accept 保证 expected QUBO energy 不上升。
+
+V11 / positive-X safety:
+  QUBOPositiveXSynchronousLocalFieldSQNN。
+  在 V10 上加入 positive-X phase alignment、角度裁剪、步长/残差 schedule，
+  主要解决 RZ 后 X' 符号翻转导致 RY 推动方向不稳定的问题。
+
+V12 / J-regularized:
+  scripts/explore_j_regularized_sqnn.py 里的 JRegularizedSyncLocalSQNN。
+  加入 J_i = -F_i Delta p_i 方向约束、trust region、round weighting，
+  目标是让每轮概率变化更一致地朝降低 QUBO energy / 增大 cut 的方向走。
+
+V13 / MaxCut-3 symmetry route:
+  在 V12/J-regularized core 上加入 random RY/RZ symmetry breaking、
+  two-stage trust、可选 classical warm-start。
+  这一阶段开始集中追 MaxCut-3 direct readout，而不是泛 QUBO warm-start。
+
+V14-XY / phase-aware route:
+  PhaseAwareJRegularizedSQNN。
+  加入 short/long phase memory、XY feedback、z-edge cavity、late collapse、
+  final rotation、MultiHeadPhaseAwareSQNN 等机制。
+  旧 V14-XY = full-time XY feedback + z-edge cavity + late collapse，
+  现在降级为对照路线。
+
+Clean-ZEdge / 当前主线:
+  仍属于 V14 phase-aware 家族，但删除 full-time XY feedback；
+  使用 short phase memory + directed z-edge anti-correlation + late collapse；
+  代码配置名为 clean_edgeboost_mem060。
+  当前主指标是可实验测量的 Z-basis deterministic direct readout C_d。
+```
+
+当前可以这样称呼：
+
+```text
+基础版：V10 sync-local SQNN。
+当前版：Clean-ZEdge，也可写成 V14-clean / Clean-ZEdge。
 ```
 
 ---
@@ -60,7 +125,7 @@ W = sum_{(i,j) in E} w_ij
 1. 它和 QAOA / Google MaxCut-3 文献直接相关；
 2. 有清晰 classical baseline：GW expected、GW sampled、CP-SAT / SDP upper bound；
 3. 随机 3-正则图足够标准，方便与主流论文对齐；
-4. 它比 planted parity 更接近我们最终想做的 QAOA warm-start 场景。
+4. 它比 planted parity 更接近我们最终想做的 QAOA/SQNN 物理可实现组合优化场景。
 ```
 
 暂时封存但不删除的方向：
@@ -101,8 +166,8 @@ name: Clean-ZEdge
 ```text
 1. 十图扫描已经验证：全时 XY feedback 没有稳定收益，当前主线删除它；
 2. short phase memory + directed z-edge anti-correlation + late collapse 更干净；
-3. 当前收益主要体现在最终 bitstring readout，而不是 expected probability cut；
-4. 后续要验证 Clean-ZEdge 是否也能提升 Bloch hyperplane readout。
+3. 当前收益主要体现在最终 Z-basis deterministic bitstring readout，而不是 expected probability cut；
+4. 当前主目标是提升可直接物理测量的 C_d，而不是从固定分布里寻找更强的后处理读出。
 ```
 
 外部十图扫描结果：
@@ -118,7 +183,7 @@ Clean-ZEdge:
   directgreedy gap = +0.014508
 ```
 
-这表示 Clean-ZEdge 的 `C_d` 和 `C_s` 已经能超过论文口径 `GW expected`，但 `C[p]` 还没有超过。
+这表示 Clean-ZEdge 的 `C_d` 和 `C_s` 已经能超过论文口径 `GW expected`，但 `C[p]` 还没有超过。当前主评价优先看 `C_d`，因为它对应 Z-basis deterministic readout，最接近可直接实验测量的输出。
 
 ### 1.3 旧主线的定位
 
@@ -133,7 +198,7 @@ V14-XY = full-time XY feedback + z-edge cavity + late collapse
 ```text
 1. 分析 RZ/XY 相位通道；
 2. 作为已降级对照，解释为什么主线删除 full-time XY feedback；
-3. 复查 Bloch hyperplane readout 的隐藏向量质量。
+3. 复查 full-time XY feedback 对 direct readout 的影响。
 ```
 
 ---
@@ -187,6 +252,7 @@ E[p] = -C[p]
 ```
 
 训练时的主优化目标仍然是 Z-basis / product-distribution expected MaxCut，而不是直接优化一个外部 teacher 或完整向量损失。
+但最终要汇报和推进的主输出不是概率分布本体，而是由这个概率态读出的 deterministic Z-basis bitstring `x_d` 及其 `C_d`。
 
 ---
 
@@ -204,6 +270,15 @@ r_i = (X_i, Y_i, Z_i)
 
 ```text
 p_i = P(x_i = 1) = (1 - Z_i) / 2
+```
+
+反向初始化约定：
+
+```text
+如果外部传入 initial_probabilities，它必须表示 P(x_i = 1)，
+因此 Bloch 初始化应使用 Z_i = 1 - 2 p_i。
+默认主线不传 initial_probabilities，而是从 |+> 开始：
+X_i = 1, Y_i = 0, Z_i = 0, p_i = 0.5。
 ```
 
 这点必须保持清楚：
@@ -459,7 +534,8 @@ C_p = C[p]
 不接 greedy。
 ```
 
-这是判断“概率分布本体是否强”的指标。
+这是辅助诊断指标，用来观察 product Bernoulli 分布本身的能量形状。
+它不是当前最终优化目标，也不是主评价指标。
 
 ### 5.2 SQNN direct
 
@@ -473,6 +549,8 @@ C_d   = C(x_d)
 ```text
 最干净的 deterministic Z-basis readout。
 当前主模型质量优先看 C_d。
+它对应按每个变量的 Z-basis 概率做确定性测量/阈值读出，
+是当前最重要的物理可实验输出口径。
 ```
 
 ### 5.3 SQNN directgreedy
@@ -512,7 +590,7 @@ C_s     = C(x_s)
 如果 sample 后接 greedy，必须写成 C_sg，不能混进 C_s。
 ```
 
-### 5.5 Bloch hyperplane readout
+### 5.5 Bloch hyperplane readout 已封存
 
 用隐藏 Bloch 向量：
 
@@ -537,7 +615,11 @@ x_i = 1[r_i dot g >= 0]
 
 ```text
 Bloch hyperplane readout 不是纯 Z-basis direct readout；
-它可以作为诊断和潜在 correlated readout 路线，但报告时必须单独命名。
+当前主线暂时封存这个方向。
+原因一：它主要是在优化出来的分布/隐藏向量固定后，寻找更好的后处理表达；
+       这不是对 SQNN 优化结果本身的探索。
+原因二：它的物理实验实现不直接，不能作为近期主线的可测量输出。
+历史报告中可以保留 C_bloch 作为旧诊断结果，但新的主实验默认不再要求它。
 ```
 
 ---
@@ -586,10 +668,12 @@ SDP_UB:
 
 ```text
 SQNN C_p:
-  对比 GW expected，但要说明一个是 product probability expected，一个是 vector hyperplane expected。
+  可作为辅助诊断对比 GW expected，但它不是当前最终优化目标。
+  报告时要说明一个是 product probability expected，一个是 vector hyperplane expected。
 
 SQNN C_d:
   对比 GW expected，这是当前最重要的 deterministic readout 对标。
+  它是当前主模型最优先的物理可测量指标。
 
 SQNN C_dg:
   可以对比 GW expected，但必须注明带 1-bit greedy 后处理。
@@ -598,7 +682,7 @@ SQNN C_s(K):
   对比 GW sampled-best(K)，K 要相同或明确写出。
 
 Bloch hyperplane:
-  同时对比 GW expected 和 GW sampled-best(K)。
+  当前封存；除非专门复现实验或写历史对照，不作为主实验必报指标。
 ```
 
 ---
@@ -626,10 +710,10 @@ Clean-ZEdge:
 ```text
 1. 最终 bitstring 质量很强；
 2. 概率分布 expected cut 仍未超过 GW expected；
-3. 提升来自更好的读出结构，而不是 C[p] 本身彻底超过 GW。
+3. 当前主线接受这一点：C[p] 是辅助诊断，最终目标优先是可测量的 C_d。
 ```
 
-### 7.2 Bloch hyperplane
+### 7.2 Bloch hyperplane 封存说明
 
 本机旧 V14 / mix route 的五 seed 结果：
 
@@ -642,9 +726,9 @@ Bloch hyperplane mean C/W     = 0.902604
 解释：
 
 ```text
-1. SQNN 隐藏 Bloch 向量含有独立概率读出没有利用到的相关结构；
-2. Bloch hyperplane 比 Bernoulli sample 更稳定；
-3. 这组旧结果没有按现在的 GW expected / GW sampled-best 规范拆分，需要重新评估。
+1. 这些结果说明旧路线的隐藏 Bloch 向量可用于后处理相关读出；
+2. 但它主要回答“固定分布/隐藏向量如何读得更好”，不是当前 SQNN 优化机制本身的问题；
+3. 它的物理实现路径不直接，当前不作为主线诊断或近期实验目标。
 ```
 
 ### 7.3 n=1024 轻量检查
@@ -661,7 +745,7 @@ Bloch hyperplane C/W   = 0.889974
 
 ```text
 1. n=1024 仍可接近 0.89；
-2. Bloch hyperplane 提升较小；
+2. 旧报告中的 Bloch hyperplane 提升较小，且该方向当前已封存；
 3. n=1024 需要用 Clean-ZEdge 重新跑，不能直接沿用旧 V14-XY 结论。
 ```
 
@@ -676,7 +760,11 @@ reset route:
   已放弃。reset 后近似比变差，不再推进。
 
 full-vector auxiliary loss:
-  直接把 full-vector anti-alignment 放进 loss 会伤害 direct/sample/Bloch readout。
+  直接把 full-vector anti-alignment 放进 loss 会伤害 direct/sample readout。
+
+Bloch hyperplane readout:
+  当前封存。它是固定隐藏向量后的后处理读出，不是近期主线优化目标；
+  物理实验实现也不够直接。
 
 target relation / target-mix:
   多轮扫描负结果，暂时封存。
@@ -739,22 +827,23 @@ GW_expected
 gap_to_GW_expected
 ```
 
-### 9.3 Clean-ZEdge + Bloch hyperplane
+### 9.3 Direct-readout 物理口径复查
 
 目标：
 
 ```text
-检查 Clean-ZEdge 是否也能提升 hidden Bloch embedding 的 hyperplane readout。
+检查 Clean-ZEdge 的 Z-basis deterministic direct readout 是否稳定。
+把 C_d 作为主指标，C_p / C_s(K) 只作为辅助诊断。
 ```
 
-必须同时报告：
+必须报告：
 
 ```text
 C_d
+C_p
 C_s(K)
-C_bloch(K)
 GW_expected
-GW_sampled_best(K)
+gap_to_GW_expected
 ```
 
 ### 9.4 n=1024 scale check
@@ -771,7 +860,7 @@ degree = 3
 
 ```text
 1. 检查 C_d 是否仍能接近或超过 GW expected；
-2. 检查 Bloch hyperplane 是否还能带来额外收益；
+2. 检查 direct readout 的尺度稳定性；
 3. 记录 residual active variables 和 max component。
 ```
 
@@ -792,9 +881,10 @@ degree = 3
    把 scalar z-edge message 升级为小共享 edge state，
    但必须保持参数共享，避免节点级参数爆炸。
 
-4. Probability distribution improvement:
-   如果目标是让 C[p] 也超过 GW expected，需要设计更直接提升 product expected cut 的结构，
-   不能只靠后处理 readout。
+4. Direct-readout improvement:
+   优先提升 Z-basis deterministic C_d。
+   C[p] 可以辅助观察分布形状，但不是当前最终优化目标。
+   模型改进要服务于最终可测 bitstring，而不是只让 product expected objective 变漂亮。
 ```
 
 ---
@@ -823,7 +913,7 @@ config.json 或等价配置
    C_over_W, C_over_Cstar, C_over_UB, C_over_best_known
 
 4. 读出：
-   C_p, C_d, C_dg, C_s(K), C_bloch(K)
+   C_d 为主，C_p / C_dg / C_s(K) 按实验需要作为辅助
 
 5. baseline：
    GW expected, GW sampled-best(K), random + greedy
@@ -832,7 +922,7 @@ config.json 或等价配置
    是否使用 1-bit greedy，greedy passes 多少
 
 7. 采样：
-   sample K，hyperplane K
+   sample K
 ```
 
 主计划不再记录所有中间失败 sweep。失败路线只在下面两种情况进入主计划：

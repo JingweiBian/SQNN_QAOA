@@ -39,7 +39,7 @@ from quantum.warmstart import (  # noqa: E402
 )
 from quantum.warmstart.losses import bernoulli_entropy  # noqa: E402
 from quantum.warmstart.qubo import QUBOProblem  # noqa: E402
-from quantum.warmstart.qubo_sqnn import bloch_to_probabilities  # noqa: E402
+from quantum.warmstart.qubo_sqnn import bloch_to_probabilities, probabilities_to_bloch  # noqa: E402
 
 
 SUMMARY_FIELDS = [
@@ -347,7 +347,7 @@ class JRegularizedSyncLocalSQNN(nn.Module):
         bloch = torch.zeros((problem.num_variables, 3), dtype=self.dtype, device=self.device)
         if self.initial_probabilities.numel() == problem.num_variables:
             initial = self.initial_probabilities.to(device=self.device, dtype=self.dtype).clamp(1e-6, 1.0 - 1e-6)
-            z_value = 2.0 * initial - 1.0
+            z_value = probabilities_to_bloch(initial)
             bloch[:, 0] = torch.sqrt((1.0 - z_value * z_value).clamp_min(0.0))
             bloch[:, 2] = z_value
         else:

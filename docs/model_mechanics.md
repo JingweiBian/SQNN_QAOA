@@ -4,6 +4,8 @@
 
 > `R_Z` 主要改变 `X-Y` 平面中的相干相位，不直接改变变量取 0/1 的概率；`R_Y` 负责把当前的 `X` 分量转成 `Z` 偏置，从而直接影响 `P(x_i=1)`。但多轮迭代时，`R_Z` 会改变后续 `R_Y` 的有效方向，因此需要角度裁剪、步长衰减和残差更新来稳定训练/推理。
 
+当前主线使用这个结构直接产生 Z-basis deterministic readout。这里的 QAOA 关联主要是 cost/mixer 交替思想：局部 cost field 推动概率偏置，mixer-like 旋转保留探索能力；它不是把 SQNN 只当成后续 QAOA 或贪心算法的 warm-start 预处理。
+
 ---
 
 ## 1. Bloch 向量的基本含义
@@ -45,6 +47,14 @@ Z_i<0 \Rightarrow x_i=1 \text{ 更可能}.
 ```
 
 `X_i` 和 `Y_i` 不直接对应 0/1 概率，而是表示 `|0\rangle` 和 `|1\rangle` 之间的相干信息。可以把它们理解成隐藏传播通道或相位记忆通道。
+
+因此，代码中的 `initial_probabilities` 一律应理解为 `P(x_i=1)`。若要从给定概率初始化 Bloch 向量，必须使用：
+
+```math
+Z_i = 1 - 2P(x_i=1).
+```
+
+如果没有外部初始概率，当前主线默认从 `|+\rangle` 开始，即 `r_i=(1,0,0)`，此时 `Z_i=0` 且 `P(x_i=1)=0.5`。
 
 ---
 
@@ -843,3 +853,5 @@ X_i'<0,
 前期：大步传播，快速探索图结构；
 后期：小步微调，减少振荡并稳定高置信变量。
 ```
+
+评价上，`C[p]` 只说明 product Bernoulli 概率分布本身的 expected cut 形状；当前主线最终关心的是 `p_i >= 0.5` 得到的 Z-basis deterministic bitstring 和 `C_d`。隐藏 `X/Y/Z` 向量用于解释相位传播，但不再作为近期 hyperplane readout 诊断主线。

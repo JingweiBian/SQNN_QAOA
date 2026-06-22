@@ -12,12 +12,14 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from quantum.warmstart import (
+    PhaseAwareJRegularizedSQNN,
     QUBOProblem,
     QUBOQuantumDataWarmStartSQNN,
     QUBOSynchronousLocalFieldSQNN,
     calibrate_probabilities_with_assignment,
     componentwise_qaoa_resource_summary,
     make_planted_parity_qubo,
+    make_random_regular_maxcut,
     optimize_qaoa_statevector,
     qubo_component_subproblems,
     qubo_connected_components,
@@ -116,6 +118,33 @@ def main():
         raise AssertionError(
             f"negative local field should push P(x=1) above 0.5, got {negative_probability}"
         )
+
+    initial_probabilities = torch.tensor([0.2, 0.5, 0.8])
+    phase_problem = QUBOProblem.from_terms(
+        num_variables=3,
+        linear=torch.zeros(3),
+    )
+    phase_model = PhaseAwareJRegularizedSQNN(
+        num_variables=3,
+        message_rounds=0,
+        initial_probabilities=initial_probabilities,
+    )
+    recovered_probabilities = phase_model(phase_problem)
+    if not torch.allclose(recovered_probabilities, initial_probabilities, atol=1e-6):
+        raise AssertionError(
+            "PhaseAwareJRegularizedSQNN initial_probabilities must mean P(x=1); "
+            f"expected {initial_probabilities}, got {recovered_probabilities}"
+        )
+
+    maxcut3 = make_random_regular_maxcut(8, average_degree=3, seed=5)
+    if maxcut3.problem.num_edges != 12:
+        raise AssertionError(f"unexpected MaxCut-3 edge count: {maxcut3.problem.num_edges}")
+    if not torch.all(maxcut3.edge_weight == 1.0):
+        raise AssertionError(f"MaxCut-3 benchmark should be unweighted: {maxcut3.edge_weight}")
+    if not torch.all(maxcut3.problem.edge_weight == 2.0):
+        raise AssertionError(f"MaxCut-3 QUBO pair weights should be 2w: {maxcut3.problem.edge_weight}")
+    if maxcut3.problem.node_degrees(weighted=False).detach().cpu().tolist() != [3.0] * 8:
+        raise AssertionError(f"MaxCut-3 benchmark should be 3-regular: {maxcut3.problem.node_degrees()}")
 
     all_isolated = QUBOProblem.from_terms(
         num_variables=2,

@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 
-"""Phase-aware/J-regularized SQNN models for QUBO and MaxCut warm-start."""
+"""Phase-aware/J-regularized SQNN models for QUBO and MaxCut direct readout."""
 
 import math
 
@@ -9,7 +9,7 @@ import torch.nn as nn
 
 from ..core.layers import _apply_bloch_noise, _apply_bloch_rotation
 from .qubo import QUBOProblem
-from .qubo_sqnn import bloch_to_probabilities
+from .qubo_sqnn import bloch_to_probabilities, probabilities_to_bloch
 
 class PhaseAwareJRegularizedSQNN(nn.Module):
     def __init__(
@@ -150,7 +150,7 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         bloch = torch.zeros((problem.num_variables, 3), dtype=self.dtype, device=self.device)
         if self.initial_probabilities.numel() == problem.num_variables:
             initial = self.initial_probabilities.to(device=self.device, dtype=self.dtype).clamp(1e-6, 1.0 - 1e-6)
-            z_value = 2.0 * initial - 1.0
+            z_value = probabilities_to_bloch(initial)
             bloch[:, 0] = torch.sqrt((1.0 - z_value * z_value).clamp_min(0.0))
             bloch[:, 2] = z_value
         else:
@@ -362,10 +362,12 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         )
         edge_weight = problem.edge_weight.to(device=self.device, dtype=self.dtype).abs()
         directed_weight = torch.cat((edge_weight, edge_weight), dim=0)
-        z_value = 2.0 * probabilities.to(device=self.device, dtype=self.dtype) - 1.0
+        # This is p-centered bit polarity, not Bloch Z.  Positive values mean
+        # x=1 is favored; the RY collapse angle uses this sign convention.
+        bit_polarity = 2.0 * probabilities.to(device=self.device, dtype=self.dtype) - 1.0
 
         if edge_z_message.numel() != 2 * edge_count:
-            edge_z_message = -z_value[tail]
+            edge_z_message = -bit_polarity[tail]
         else:
             edge_z_message = edge_z_message.to(device=self.device, dtype=self.dtype)
 
@@ -384,16 +386,16 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         if z_message_gain is None:
             z_message_gain = self.z_message_gain
         gain = torch.as_tensor(max(float(z_message_gain), 1e-6), dtype=self.dtype, device=self.device)
-        tail_belief = self_mix * z_value[tail] + (1.0 - self_mix) * cavity_tail_belief
-        # MaxCut wants opposite Z signs across an edge, so tail->head suggests
-        # the negative of tail's non-backtracking cavity belief.
+        tail_belief = self_mix * bit_polarity[tail] + (1.0 - self_mix) * cavity_tail_belief
+        # MaxCut wants opposite bit polarities across an edge, so tail->head
+        # suggests the negative of tail's non-backtracking cavity belief.
         raw_message = -torch.tanh(gain * tail_belief)
         damping = min(max(float(self.z_message_confidence_damping), 0.0), 0.95)
         if damping > 0.0:
             # Highly polarized nodes can dominate their neighbors too early.
             # This attenuates outgoing Z messages while leaving the Z-basis
             # objective and final readout unchanged.
-            tail_confidence = z_value[tail].abs()
+            tail_confidence = bit_polarity[tail].abs()
             raw_message = raw_message * (1.0 - damping * tail_confidence).clamp_min(0.05)
 
         decay = torch.as_tensor(
@@ -406,7 +408,7 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         node_suggestion = torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
         node_suggestion.index_add_(0, head, directed_weight * next_message)
         node_suggestion = (node_suggestion / degree.clamp_min(1e-6)).clamp(-1.0, 1.0)
-        z_error = (node_suggestion - z_value).clamp(-1.0, 1.0)
+        z_error = (node_suggestion - bit_polarity).clamp(-1.0, 1.0)
         return z_error, node_suggestion, next_message
 
     def _node_step_scale(self, local_field, old_probabilities):

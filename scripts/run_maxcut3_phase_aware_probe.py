@@ -60,6 +60,7 @@ EXTRA_SUMMARY_FIELDS = [
     "z_message_gain",
     "z_message_gain_final",
     "z_message_gain_schedule_start",
+    "z_message_confidence_damping",
     "head_count",
     "head_seed_stride",
     "node_step_mode",
@@ -110,6 +111,7 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         z_message_gain=1.0,
         z_message_gain_final=None,
         z_message_gain_schedule_start=0.60,
+        z_message_confidence_damping=0.0,
         node_step_mode="none",
     ):
         super().__init__()
@@ -140,6 +142,7 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
             None if z_message_gain_final is None else float(z_message_gain_final)
         )
         self.z_message_gain_schedule_start = float(z_message_gain_schedule_start)
+        self.z_message_confidence_damping = float(z_message_confidence_damping)
         self.node_step_mode = str(node_step_mode)
 
         if initial_probabilities is None:
@@ -441,6 +444,13 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         # MaxCut wants opposite Z signs across an edge, so tail->head suggests
         # the negative of tail's non-backtracking cavity belief.
         raw_message = -torch.tanh(gain * tail_belief)
+        damping = min(max(float(self.z_message_confidence_damping), 0.0), 0.95)
+        if damping > 0.0:
+            # Highly polarized nodes can dominate their neighbors too early.
+            # This attenuates outgoing Z messages while leaving the Z-basis
+            # objective and final readout unchanged.
+            tail_confidence = z_value[tail].abs()
+            raw_message = raw_message * (1.0 - damping * tail_confidence).clamp_min(0.05)
 
         decay = torch.as_tensor(
             min(max(float(self.z_message_decay), 0.0), 1.0),
@@ -517,7 +527,35 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
             relation_signal = cavity_torque
         if "edge_cavity_xy" in self.phase_mode:
             relation_signal = edge_cavity_torque
-        if "z_edge_cavity" in self.phase_mode:
+        collapse_start_round = int(round(float(self.message_rounds) * self.two_stage_fraction))
+        collapse_denominator = max(int(self.message_rounds) - 1 - collapse_start_round, 1)
+        collapse_progress = min(
+            max((int(round_index) - collapse_start_round) / float(collapse_denominator), 0.0),
+            1.0,
+        )
+        if "z_edge_mix025_decay" in self.phase_mode:
+            target_mix = 0.25 * (1.0 - collapse_progress)
+            relation_signal = (z_edge_error + target_mix * z_edge_suggestion).clamp(-1.0, 1.0)
+        elif "z_edge_mix025_ramp" in self.phase_mode:
+            target_mix = 0.25 * collapse_progress
+            relation_signal = (z_edge_error + target_mix * z_edge_suggestion).clamp(-1.0, 1.0)
+        elif "z_edge_mix025_agree" in self.phase_mode:
+            agreement_gate = (z_edge_error * z_edge_suggestion > 0.0).to(dtype=self.dtype)
+            relation_signal = (z_edge_error + 0.25 * agreement_gate * z_edge_suggestion).clamp(-1.0, 1.0)
+        elif "z_edge_mix025_softagree" in self.phase_mode:
+            agreement_gate = torch.relu(torch.tanh(10.0 * z_edge_error * z_edge_suggestion))
+            relation_signal = (z_edge_error + 0.25 * agreement_gate * z_edge_suggestion).clamp(-1.0, 1.0)
+        elif "z_edge_mix010" in self.phase_mode:
+            relation_signal = (z_edge_error + 0.10 * z_edge_suggestion).clamp(-1.0, 1.0)
+        elif "z_edge_mix015" in self.phase_mode:
+            relation_signal = (z_edge_error + 0.15 * z_edge_suggestion).clamp(-1.0, 1.0)
+        elif "z_edge_mix025" in self.phase_mode:
+            relation_signal = (z_edge_error + 0.25 * z_edge_suggestion).clamp(-1.0, 1.0)
+        elif "z_edge_mix035" in self.phase_mode:
+            relation_signal = (z_edge_error + 0.35 * z_edge_suggestion).clamp(-1.0, 1.0)
+        elif "z_edge_target" in self.phase_mode:
+            relation_signal = z_edge_suggestion
+        elif "z_edge_cavity" in self.phase_mode:
             relation_signal = z_edge_error
         if "phase_diff" in self.phase_mode:
             relation_signal = phase_diff_signal
@@ -884,6 +922,7 @@ def build_variants(base, rounds, epochs):
         z_message_gain=1.0,
         z_message_gain_final="",
         z_message_gain_schedule_start=0.60,
+        z_message_confidence_damping=0.0,
         head_count=1,
         head_seed_stride=7919,
         node_step_mode="none",
@@ -1096,6 +1135,442 @@ def build_variants(base, rounds, epochs):
             ),
         ),
         (
+            "v14_memory_xy_z_edge_target_gain12_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_target_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_rot00_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.00,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_rot10_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.10,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_entropy_zero_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+                entropy_weight=0.02,
+                final_entropy_weight=0.0,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_entropy_sharp003_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+                entropy_weight=0.02,
+                final_entropy_weight=-0.003,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_zdecay05_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.50,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_zdecay035_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.35,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_zdecay04_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.40,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_zdecay06_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.60,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_zdecay065_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.65,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_zdecay075_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.75,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_zdecay85_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.85,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_zself025_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.25,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_zself075_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.75,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_j50_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+                j_weight=50.0,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_j150_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+                j_weight=150.0,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_vector002_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+                vector_loss_weight=0.02,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_gain12_vector005_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+                vector_loss_weight=0.05,
+            ),
+        ),
+        (
+            "v14_memory_xy_edgecavity_zmix025_gain12_phase03_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_edge_cavity_xy_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                neighbor_phase_init=0.03,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                edge_message_decay=0.70,
+                edge_message_self_mix=0.50,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_edgecavity_zmix025_gain12_phase06_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_edge_cavity_xy_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                neighbor_phase_init=0.06,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                edge_message_decay=0.70,
+                edge_message_self_mix=0.50,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_agree_gain12_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_agree_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_softagree_gain12_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_softagree_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_decay_gain12_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_decay_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_ramp_gain12_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_ramp_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix010_gain12_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix010_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix015_gain12_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix015_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix035_gain12_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix035_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_gain12_outdamp025_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+                z_message_confidence_damping=0.25,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_gain12_outdamp050_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.2,
+                z_message_confidence_damping=0.50,
+            ),
+        ),
+        (
             "v14_memory_xy_z_edge_gain13_collapse",
             dict(
                 symmetry_breaking="random_rz_ry",
@@ -1165,6 +1640,102 @@ def build_variants(base, rounds, epochs):
                 z_message_gain=1.0,
                 z_message_gain_final=2.6,
                 z_message_gain_schedule_start=0.60,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_gain_schedule_0p8_1p4_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=0.8,
+                z_message_gain_final=1.4,
+                z_message_gain_schedule_start=0.45,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_target_schedule_0p8_1p4_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_target_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=0.8,
+                z_message_gain_final=1.4,
+                z_message_gain_schedule_start=0.45,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_mix025_schedule_0p8_1p4_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_mix025_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=0.8,
+                z_message_gain_final=1.4,
+                z_message_gain_schedule_start=0.45,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_gain_schedule_0p6_1p4_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=0.6,
+                z_message_gain_final=1.4,
+                z_message_gain_schedule_start=0.45,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_gain_schedule_1p0_1p4_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=1.0,
+                z_message_gain_final=1.4,
+                z_message_gain_schedule_start=0.45,
+            ),
+        ),
+        (
+            "v14_memory_xy_z_edge_gain_schedule_0p8_1p6_collapse",
+            dict(
+                symmetry_breaking="random_rz_ry",
+                phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
+                phase_memory_decay=0.80,
+                xy_feedback_init=0.05,
+                collapse_init=0.03,
+                final_rotation_max=0.05,
+                z_message_decay=0.70,
+                z_message_self_mix=0.50,
+                z_message_gain=0.8,
+                z_message_gain_final=1.6,
+                z_message_gain_schedule_start=0.45,
             ),
         ),
         (
@@ -1374,6 +1945,7 @@ def train_phase_one(config, device, output_dir):
             else float(config.get("z_message_gain_final"))
         ),
         z_message_gain_schedule_start=float(config.get("z_message_gain_schedule_start", 0.60)),
+        z_message_confidence_damping=float(config.get("z_message_confidence_damping", 0.0)),
         node_step_mode=config.get("node_step_mode", "none"),
     )
     if int(config.get("head_count", 1)) > 1:
@@ -1481,6 +2053,7 @@ def train_phase_one(config, device, output_dir):
     for key in PHASE_SUMMARY_FIELDS:
         summary.setdefault(key, "")
 
+    run_dir.mkdir(parents=True, exist_ok=True)
     trace_path = run_dir / "trace_rows.csv"
     with trace_path.open("w", newline="", encoding="utf-8") as file_obj:
         fields = list(rows[0].keys())
@@ -1488,6 +2061,7 @@ def train_phase_one(config, device, output_dir):
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+    run_dir.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -1496,6 +2070,7 @@ def train_phase_one(config, device, output_dir):
         },
         run_dir / "model.pt",
     )
+    run_dir.mkdir(parents=True, exist_ok=True)
     with metrics_path.open("w", encoding="utf-8") as file_obj:
         json.dump(
             {

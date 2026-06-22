@@ -7941,3 +7941,947 @@ long-term target = C/C* or C/C_best_known after exact or best-known values are i
    每个主实验都应同时报告 SQNN direct、SQNN sample、random+greedy、GW-style，
    避免只看单 seed 或只看 C/W 的局部提升。
 ```
+
+#### 18.29.16 Adaptive Z-edge schedule probe
+
+基于 18.29.15，本轮实现两类轻量改动：
+
+```text
+1. z_message_confidence_damping:
+   对已经高度极化的节点，降低它向邻居发出的 Z-edge message 强度。
+   这不改变损失函数，也不改变最终 Z-basis readout，只改变隐藏相位消息传播。
+
+2. gain schedule 0.8 -> 1.4:
+   前期使用较弱 Z-edge gain，后期再逐步升到 1.4。
+   目的不是调阈值，而是避免早期错误 block 被强边消息过早固化。
+```
+
+新增代码：
+
+```text
+scripts/run_maxcut3_phase_aware_probe.py
+  z_message_confidence_damping
+  v14_memory_xy_z_edge_gain12_outdamp025_collapse
+  v14_memory_xy_z_edge_gain12_outdamp050_collapse
+  v14_memory_xy_z_edge_gain_schedule_0p8_1p4_collapse
+
+scripts/plot_maxcut3_adaptive_schedule_review.py
+```
+
+输出位置：
+
+```text
+outputs/maxcut3_v14_z_edge_adaptive_probe_seed7/
+outputs/maxcut3_v14_z_edge_adaptive_probe_seed7_rescore_8192/
+outputs/maxcut3_v14_z_edge_adaptive_probe_seed23/
+outputs/maxcut3_v14_z_edge_adaptive_probe_seed23_rescore_8192/
+outputs/maxcut3_v14_z_edge_adaptive_probe_seed42_seed99/
+outputs/maxcut3_v14_z_edge_adaptive_probe_seed42_seed99_rescore_8192/
+outputs/maxcut3_v14_z_edge_gain14_seed_probe_v2_rescore_8192/
+outputs/maxcut3_v14_adaptive_schedule_four_seed_review/
+```
+
+可视化：
+
+```text
+outputs/maxcut3_v14_adaptive_schedule_four_seed_review/maxcut3_adaptive_schedule_review.png
+outputs/maxcut3_v14_adaptive_schedule_four_seed_review/maxcut3_adaptive_schedule_review.md
+```
+
+关键结果：
+
+```text
+seed=7:
+  gain=1.4 direct C/W = 0.872396
+  gain=1.2 direct C/W = 0.882812
+  schedule 0.8->1.4 direct C/W = 0.890625
+  schedule 0.8->1.4 8192-sample C/W = 0.901042
+  GW-style C/W = 0.915365
+
+seed=23:
+  gain=1.4 direct C/W = 0.881510
+  gain=1.2 direct C/W = 0.889323
+  schedule 0.8->1.4 direct C/W = 0.890625
+  schedule 0.8->1.4 8192-sample C/W = 0.897135
+  GW-style C/W = 0.916667
+
+seed=42:
+  gain=1.4 direct C/W = 0.901042
+  schedule 0.8->1.4 direct C/W = 0.902344
+  schedule 0.8->1.4 8192-sample C/W = 0.906250
+  GW-style C/W = 0.925781
+
+seed=99:
+  gain=1.4 direct C/W = 0.893229
+  schedule 0.8->1.4 direct C/W = 0.891927
+  schedule 0.8->1.4 8192-sample C/W = 0.902344
+  GW-style C/W = 0.914062
+```
+
+四 seed 汇总：
+
+```text
+fixed gain=1.4 direct mean C/W = 0.887044
+schedule 0.8->1.4 direct mean C/W = 0.893880
+
+fixed gain=1.4 256-sample mean C/W = 0.890625
+schedule 0.8->1.4 256-sample mean C/W = 0.897135
+
+schedule 0.8->1.4 8192-sample mean C/W = 0.901693
+oracle best among tested routes, 8192-sample mean C/W = 0.902018
+```
+
+阶段性判断：
+
+```text
+1. confidence damping 暂时失败。
+   seed=7 上 outdamp025 direct C/W = 0.878906，
+   outdamp050 direct C/W = 0.868490，均低于 gain=1.2 和 schedule。
+   说明简单削弱高置信出边会损失有效传播，不是当前主线。
+
+2. gain schedule 是真实有效改进。
+   它把 seed=7 这个弱 seed 的 direct 从 0.872396/0.882812 抬到 0.890625，
+   并且 8192-sample 首次超过 0.90，达到 0.901042。
+
+3. schedule 不是所有 seed 的最优路线。
+   seed=99 上固定 gain=1.4 的 direct 和 8192-sample 仍略好。
+   因此下一步不应固定一种路线，而应做 early diagnostic selector。
+
+4. J<0 fraction 不能单独作为路线好坏指标。
+   seed=7 的 schedule J<0 fraction 更高，但最终 C/W 更好。
+   这说明 J 约束是方向安全工具，不是最终结构质量的充分判据。
+```
+
+下一步：
+
+```text
+1. 设计 early diagnostic selector：
+   用前 40/80 轮的 expected C/W、mean confidence、probability std、J<0 fraction、
+   accepted_rounds 预测该图应该走 gain=1.2、gain=1.4 还是 schedule 0.8->1.4。
+
+2. 继续探索更结构化的 Z-edge message：
+   当前 schedule 只是时间维度上的调节。
+   要继续逼近 GW，需要让边消息更好表达局部 cut block 和非回退 cavity 结构。
+
+3. 保留四 seed + GW-style baseline 为最小验证集：
+   后续任何新模型至少要报告 seed=7/23/42/99，
+   不能只看单 seed 的 0.90 突破。
+```
+
+#### 18.29.17 Early selector diagnostics
+
+本轮新增脚本：
+
+```text
+scripts/analyze_maxcut3_early_selector.py
+```
+
+目的：不训练新模型，只读取已经保存的 `trace_rows.csv`，抽取第 40/80/120 轮的早期指标：
+
+```text
+expected_ratio
+rounded_ratio
+mean_confidence
+probability_std
+J<0 fraction
+accepted_rate
+```
+
+输出位置：
+
+```text
+outputs/maxcut3_v14_early_selector_diagnostics/
+```
+
+阶段性观察：
+
+```text
+1. 固定 gain=1.4 在 seed=7/23 上第 80 轮 confidence 偏高，expected C/W 也偏高，
+   但最终结果反而差。这像是早期过度极化和错误 cut block 固化。
+
+2. seed=42/99 的 gain=1.4 第 80 轮 confidence 低，expected C/W 接近 0.50，
+   后期反而能走到较好结果。
+
+3. 因此 early selector 的第一版规则可以考虑：
+   如果固定 gain=1.4 在前 80 轮过早高 confidence 或 expected_ratio 明显抬升，
+   则转向 schedule / gain=1.2；
+   如果前 80 轮仍低 confidence，则固定 gain=1.4 或温和 schedule 可能更好。
+
+4. 这只是四个 seed 的诊断，不是可发表结论。
+   但它已经足够指导下一批实验：selector 应围绕“早锁错检测”设计。
+```
+
+#### 18.29.18 Schedule endpoint tuning
+
+在 `0.8 -> 1.4` 取得正结果后，继续测试：
+
+```text
+0.6 -> 1.4
+1.0 -> 1.4
+0.8 -> 1.6
+```
+
+输出位置：
+
+```text
+outputs/maxcut3_v14_z_edge_schedule_endpoint_probe_seed7/
+outputs/s99_ep/
+outputs/s23s42_ep/
+outputs/s7_ep_rescore_8192/
+outputs/s99_ep_rescore_8192/
+```
+
+注意：Windows 下长 output-dir + 长 run_id 会接近 260 字符路径限制。
+后续长实验输出目录应使用短名，例如：
+
+```text
+outputs/s99_ep/
+outputs/s23s42_ep/
+```
+
+结果：
+
+```text
+seed=7:
+  0.6 -> 1.4 direct C/W = 0.886719
+  1.0 -> 1.4 direct C/W = 0.890625
+  1.0 -> 1.4 8192-sample C/W = 0.895833
+  0.8 -> 1.6 direct C/W = 0.881510
+  current best remains 0.8 -> 1.4:
+    direct C/W = 0.890625
+    8192-sample C/W = 0.901042
+
+seed=23:
+  1.0 -> 1.4 direct C/W = 0.891927
+  1.0 -> 1.4 256-sample C/W = 0.893229
+  compared with 0.8 -> 1.4:
+    direct C/W = 0.890625
+    256-sample C/W = 0.894531
+
+seed=42:
+  1.0 -> 1.4 direct C/W = 0.895833
+  1.0 -> 1.4 256-sample C/W = 0.897135
+  this is worse than 0.8 -> 1.4 direct 0.902344 and gain=1.4 8192-sample 0.906250.
+
+seed=99:
+  1.0 -> 1.4 direct C/W = 0.899740
+  1.0 -> 1.4 256-sample C/W = 0.901042
+  1.0 -> 1.4 8192-sample C/W = 0.903646
+  this matches gain=1.4 8192-sample and greatly improves direct readout.
+```
+
+阶段性判断：
+
+```text
+1. 0.6 -> 1.4 太保守，0.8 -> 1.6 对 seed=7 太强。
+
+2. 1.0 -> 1.4 是一个很好的 direct-readout stabilizer：
+   它抬高 seed=99 direct 到 0.899740，也抬高 seed=23 direct 到 0.891927。
+
+3. 但 1.0 -> 1.4 会明显伤害 seed=42 的高上限。
+   所以它不能直接替代 0.8 -> 1.4 或固定 gain=1.4。
+
+4. 当前最合理的主线不是单 schedule，而是 selector：
+   - seed=7 类过早锁错图：0.8 -> 1.4；
+   - seed=99 类 direct 读出弱但结构还好的图：1.0 -> 1.4；
+   - seed=42 类高上限图：固定 gain=1.4 或 0.8 -> 1.4。
+```
+
+#### 18.29.19 Z-edge target relation negative result
+
+为了更直接表达相邻变量关系，测试了一个结构性改动：
+
+```text
+old relation_signal = z_edge_suggestion - current_z
+target relation_signal = z_edge_suggestion
+```
+
+新增变体：
+
+```text
+v14_memory_xy_z_edge_target_gain12_collapse
+v14_memory_xy_z_edge_target_schedule_0p8_1p4_collapse
+```
+
+输出位置：
+
+```text
+outputs/s7_target/
+```
+
+seed=7 结果：
+
+```text
+target gain=1.2:
+  direct C/W = 0.868490
+  256-sample C/W = 0.872396
+
+target schedule 0.8 -> 1.4:
+  direct C/W = 0.860677
+  256-sample C/W = 0.868490
+```
+
+判断：
+
+```text
+1. 直接使用 z_edge_suggestion 作为 collapse 目标太硬，会破坏原有 error-based correction 的平衡。
+2. 这条 target relation 路线先封存，不进入主线。
+3. 更合理的结构性方向应是“error + bounded target mix”或 block-level aggregate，
+   而不是完全替换成 target signal。
+```
+
+#### 18.29.20 Bounded target-mix relation
+
+纯 target relation 失败后，测试更温和的结构性边消息：
+
+```text
+old relation_signal = z_edge_suggestion - current_z
+target-mix relation_signal = (z_edge_suggestion - current_z) + 0.25 * z_edge_suggestion
+```
+
+新增变体：
+
+```text
+v14_memory_xy_z_edge_mix025_gain12_collapse
+v14_memory_xy_z_edge_mix025_schedule_0p8_1p4_collapse
+```
+
+输出位置：
+
+```text
+outputs/s7_mix025/
+outputs/s7_mix025_rescore_8192/
+outputs/mix025_others/
+outputs/mix025_others_rescore_8192/
+outputs/maxcut3_v14_candidate_routes_review/
+```
+
+可视化：
+
+```text
+outputs/maxcut3_v14_candidate_routes_review/maxcut3_adaptive_schedule_review.png
+outputs/maxcut3_v14_candidate_routes_review/maxcut3_adaptive_schedule_review.md
+```
+
+关键结果：
+
+```text
+seed=7:
+  mix025 direct C/W = 0.891927
+  mix025 256-sample C/W = 0.894531
+  mix025 8192-sample C/W = 0.901042
+
+seed=23:
+  mix025 direct C/W = 0.893229
+  mix025 256-sample C/W = 0.894531
+  mix025 8192-sample C/W = 0.901042
+
+seed=42:
+  mix025 direct C/W = 0.897135
+  mix025 256-sample C/W = 0.901042
+  mix025 8192-sample C/W = 0.902344
+
+seed=99:
+  mix025 direct C/W = 0.890625
+  mix025 256-sample C/W = 0.893229
+  mix025 8192-sample C/W = 0.899740
+```
+
+候选路线总览后的当前 best selector oracle：
+
+```text
+best direct route by seed:
+  seed=7  -> mix025,      C/W = 0.891927
+  seed=23 -> mix025,      C/W = 0.893229
+  seed=42 -> sched08to14, C/W = 0.902344
+  seed=99 -> sched10to14, C/W = 0.899740
+
+oracle best direct mean C/W = 0.896810
+
+best 8192-sample route by seed:
+  seed=7  -> sched08to14 or mix025, C/W = 0.901042
+  seed=23 -> mix025,                C/W = 0.901042
+  seed=42 -> gain14 or sched08to14, C/W = 0.906250
+  seed=99 -> gain14 or sched10to14, C/W = 0.903646
+
+oracle best 8192-sample mean C/W = 0.902995
+```
+
+判断：
+
+```text
+1. mix025 是第一个真正改善弱 seed=7/23 direct readout 的结构性边消息改动。
+   它比 pure target 稳定得多，说明“error + 少量 target”比完全 target 更合理。
+
+2. mix025 不是全局最优。
+   它会伤害 seed=99，也不能超过 seed=42 的 schedule/gain14 上限。
+
+3. 当前 direct-readout 距离 0.90 仍差一点：
+   selector oracle mean = 0.896810。
+   但是 8192-sample selector oracle 已经到 0.902995。
+
+4. 下一步最值得做：
+   - 调 target mix 系数：0.10, 0.15, 0.35；
+   - 将 mix025 与 schedule endpoint 结合；
+   - 训练或规则化 early selector，而不是固定单一路线。
+```
+
+#### 18.29.21 Target-mix coefficient scan
+
+继续在 seed=7 上扫描固定 gain=1.2 的 target mix 系数：
+
+```text
+mix010: relation = error + 0.10 * target
+mix015: relation = error + 0.15 * target
+mix025: relation = error + 0.25 * target
+mix035: relation = error + 0.35 * target
+```
+
+输出位置：
+
+```text
+outputs/s7_mix_scan/
+```
+
+结果：
+
+```text
+seed=7:
+  mix010 direct C/W = 0.872396
+  mix010 256-sample C/W = 0.876302
+
+  mix015 direct C/W = 0.882812
+  mix015 256-sample C/W = 0.885417
+
+  mix025 direct C/W = 0.891927
+  mix025 256-sample C/W = 0.894531
+  mix025 8192-sample C/W = 0.901042
+
+  mix035 direct C/W = 0.885417
+  mix035 256-sample C/W = 0.888021
+```
+
+判断：
+
+```text
+1. mix025 是当前 seed=7 的最佳 target-mix 系数。
+2. mix010/015 太弱，不能有效修正弱 seed。
+3. mix035 开始太硬，接近 pure target 的负面趋势。
+4. 后续如果继续该方向，应围绕 0.20 到 0.30 做细扫，
+   或者把 mix 系数纳入 early selector，而不是固定全局值。
+```
+
+#### 18.29.22 Seed=11 out-of-sample route check
+
+为了检查当前 V14 Z-edge 路线是否只是在已有 seed 上偶然有效，补充一个未参与前面调参的
+随机 3-正则 MaxCut seed=11。
+
+输出位置：
+
+```text
+outputs/s11_candidates/
+outputs/s11_r8192/
+outputs/gw_s11/
+outputs/s11_review/
+```
+
+候选路线：
+
+```text
+gain14
+sched08to14
+sched10to14
+mix025
+```
+
+结果：
+
+```text
+seed=11:
+  gain14 direct+1-bit greedy      C/W = 0.898438
+  gain14 8192-sample+1-bit greedy C/W = 0.904948
+
+  sched10to14 direct+1-bit greedy      C/W = 0.898438
+  sched10to14 8192-sample+1-bit greedy C/W = 0.904948
+
+  mix025 direct+1-bit greedy      C/W = 0.890625
+  sched08to14 direct+1-bit greedy C/W = 0.877604
+
+  random+1-bit greedy baseline    C/W = 0.876302
+  GW-style+1-bit greedy baseline  C/W = 0.915365
+```
+
+判断：
+
+```text
+1. seed=11 支持 gain14 / sched10to14，而不是 mix025。
+2. mix025 是弱 seed 修复器，不是全局最优路线。
+3. 当前纯 V14 最好样本读出和 GW-style baseline 的差距约为 0.0104 C/W。
+4. 下一步重点不是继续固定单一路线，而是做 instance-adaptive route 或更好的边关系传播。
+```
+
+#### 18.29.23 Early selector diagnostics with seed=11
+
+将 seed=7/11/23/42/99 的 gain14、sched08to14、sched10to14、mix025 做早期特征诊断。
+
+输出位置：
+
+```text
+outputs/early5/
+```
+
+可视化与表格：
+
+```text
+outputs/early5/maxcut3_early_selector_features.png
+outputs/early5/maxcut3_early_selector_diagnostics.md
+outputs/early5/maxcut3_early_selector_features.csv
+```
+
+直接读出赢家：
+
+```text
+seed=7  -> mix025,      C/W = 0.891927
+seed=11 -> gain14,      C/W = 0.898438
+seed=23 -> mix025,      C/W = 0.893229
+seed=42 -> sched08to14, C/W = 0.902344
+seed=99 -> sched10to14, C/W = 0.899740
+```
+
+判断：
+
+```text
+1. 没有单一早期指标可以完全解释所有路线赢家。
+2. 过早 high confidence / high expected 经常对应后期卡死，但不是充分条件。
+3. 当前 selector 不能直接宣称有效，只能作为下一步自适应机制设计的诊断依据。
+4. 更合理的路线是让模型内部的边消息自适应，而不是外部手写选择一个固定 phase。
+```
+
+#### 18.29.24 Target-mix gating and schedule negative results
+
+围绕 mix025 继续测试三类改动：
+
+```text
+agree:     relation = error + 0.25 * 1[error,target 同向] * target
+softagree: relation = error + 0.25 * soft_gate(error * target) * target
+decay:     collapse 初期 target mix = 0.25，后期衰减到 0
+ramp:      collapse 初期 target mix = 0，后期上升到 0.25
+```
+
+输出位置：
+
+```text
+outputs/agr_s7/
+outputs/mixsched_s7/
+outputs/s7_ablation_review/
+```
+
+seed=7 结果：
+
+```text
+fixed mix025 direct+1-bit greedy C/W = 0.891927
+
+agree     direct+1-bit greedy C/W = 0.878906
+softagree direct+1-bit greedy C/W = 0.884115
+decay     direct+1-bit greedy C/W = 0.885417
+ramp      direct+1-bit greedy C/W = 0.886719
+```
+
+判断：
+
+```text
+1. 门控 target 项会削弱 seed=7 的弱实例修复能力。
+2. target mix 的有效部分并不只是“与 error 同向时加强”，它可能需要在局部不一致时提供额外结构偏置。
+3. 简单时间调度也没有超过固定 mix025。
+4. 该分支暂时封存，不作为主线。
+```
+
+#### 18.29.25 Final global rotation ablation
+
+测试最终全局旋转是否是 direct Z readout 的瓶颈。
+
+输出位置：
+
+```text
+outputs/rot_s7/
+outputs/s7_ablation_review/
+```
+
+seed=7 结果：
+
+```text
+fixed mix025 final_rotation_max=0.05 direct+1-bit greedy C/W = 0.891927
+rot00       final_rotation_max=0.00 direct+1-bit greedy C/W = 0.885417
+rot10       final_rotation_max=0.10 direct+1-bit greedy C/W = 0.890625
+```
+
+判断：
+
+```text
+1. 完全关闭 final rotation 会变差，说明小旋转有帮助。
+2. 把旋转范围扩大到 0.10 没有超过 0.05。
+3. 当前 direct readout 的主要瓶颈不是最终全局 Z 校准，而是前面的边关系传播和概率分布塑形。
+4. 后续重点回到 Z-edge / phase message 的表达能力，而不是继续放大 final rotation。
+```
+
+#### 18.29.26 Entropy annealing ablation
+
+检查 direct readout 瓶颈是否来自后期概率分布不够尖。保持主能量形式不变，只改现有熵退火：
+
+```text
+default:       entropy_weight 0.02 -> 0.001
+entropy_zero:  entropy_weight 0.02 -> 0.000
+sharp003:      entropy_weight 0.02 -> -0.003
+```
+
+注意 loss 中熵项为：
+
+```text
+loss = normalized_energy - entropy_weight * entropy + J_penalty
+```
+
+因此正的 entropy_weight 鼓励保持概率随机性，负的 final_entropy_weight 会惩罚熵、让分布更尖。
+
+输出位置：
+
+```text
+outputs/ent_s7/
+outputs/s7_ablation_review/
+```
+
+seed=7 结果：
+
+```text
+default mix025 direct+1-bit greedy C/W = 0.891927
+entropy_zero  direct+1-bit greedy C/W = 0.886719
+sharp003      direct+1-bit greedy C/W = 0.882812
+```
+
+判断：
+
+```text
+1. 直接让后期分布更尖没有提升 direct readout。
+2. 过强或过早塌缩会破坏边关系协调，降低 expected/vector 指标。
+3. 当前瓶颈不是熵退火强度本身，而是 Z-edge / phase message 如何表达相邻变量关系。
+4. 后续主线应继续改边消息表达，而不是继续调熵或加 rounding loss。
+```
+
+#### 18.29.27 Z-message decay / self-mix ablation
+
+测试 Z-edge cavity message 的记忆长度和自混合比例是否是 `mix025` 的主要瓶颈。
+
+默认：
+
+```text
+z_message_decay = 0.70
+z_message_self_mix = 0.50
+```
+
+输出位置：
+
+```text
+outputs/zmsg_s7/
+outputs/zdecayfine_s7/
+outputs/zdecaymid_s7/
+```
+
+seed=7 结果：
+
+```text
+default zdecay07 direct+1-bit greedy C/W = 0.891927
+
+zdecay05 direct+1-bit greedy C/W = 0.890625
+zdecay06 direct+1-bit greedy C/W = 0.890625
+zdecay065 direct+1-bit greedy C/W = 0.888021
+zdecay075 direct+1-bit greedy C/W = 0.885417
+zdecay085 direct+1-bit greedy C/W = 0.876302
+
+zself025 direct+1-bit greedy C/W = 0.878906
+zself075 direct+1-bit greedy C/W = 0.873698
+```
+
+判断：
+
+```text
+1. Z-message 记忆不能太慢，zdecay085 明显变差。
+2. zdecay05/06 接近默认，但没有超过默认 zdecay07。
+3. self_mix 偏离 0.50 会明显变差。
+4. 当前默认 z_message_decay=0.70, z_message_self_mix=0.50 在 seed=7 上已接近局部最优。
+```
+
+#### 18.29.28 Longer optimization and J-weight ablation
+
+检查是否只是训练轮次不够，或 J penalty 权重设置不合适。
+
+输出位置：
+
+```text
+outputs/long_s7/
+outputs/jw_s7/
+```
+
+seed=7 结果：
+
+```text
+default mix025, rounds=260, epochs=115:
+  expected C/W = 0.872375
+  direct+1-bit greedy C/W = 0.891927
+  sample+1-bit greedy C/W = 0.894531
+
+long mix025, rounds=320, epochs=150:
+  expected C/W = 0.877080
+  direct+1-bit greedy C/W = 0.888021
+  sample+1-bit greedy C/W = 0.889323
+
+j_weight=50:
+  direct+1-bit greedy C/W = 0.875000
+
+j_weight=150:
+  expected C/W = 0.876210
+  direct+1-bit greedy C/W = 0.890625
+  sample+1-bit greedy C/W = 0.893229
+```
+
+判断：
+
+```text
+1. 加长训练可以继续提升 product expected objective，但会降低 direct/sample 二值解。
+2. 这说明 expected C/W 与最终 cut 质量存在错配。
+3. j_weight=50 太弱，会破坏方向约束和最终质量。
+4. j_weight=150 提升 expected/vector，但仍不能超过默认 direct 质量。
+5. 单纯优化现有 product-distribution 目标，很难把 direct readout 稳定推过 0.90。
+```
+
+#### 18.29.29 Bloch hyperplane correlated readout
+
+新增只读出、不重训的脚本：
+
+```text
+scripts/rescore_maxcut3_bloch_hyperplane_readout.py
+scripts/plot_maxcut3_bloch_readout_overview.py
+```
+
+目的：
+
+```text
+检查当前 V14 隐藏 Bloch 向量中是否已经含有比独立 Bernoulli 概率更强的相关结构。
+读出方法为随机超平面舍入：
+  x_i = 1[ r_i · g >= 0 ]
+然后接同一个 1-bit greedy local improvement。
+```
+
+输出位置：
+
+```text
+outputs/bloch_readout_s7_mix025/
+outputs/bloch_readout_s7_mix025_8192/
+outputs/bloch_readout_s11/
+outputs/bloch_readout_s11_sched10_8192/
+outputs/bloch_readout_s42_s99_sched08/
+outputs/bloch_readout_s99_sched10/
+outputs/bloch_readout_mix025_others/
+outputs/bloch_readout_overview/
+```
+
+总览图：
+
+```text
+outputs/bloch_readout_overview/bloch_readout_overview.png
+outputs/bloch_readout_overview/bloch_readout_overview.md
+```
+
+关键结果：
+
+```text
+seed=7:
+  direct+greedy        C/W = 0.891927
+  Bernoulli sample     C/W = 0.894531
+  Bloch XYZ hyperplane C/W = 0.899740
+  GW-style baseline    C/W = 0.915365
+
+seed=11:
+  direct+greedy        C/W = 0.898438
+  Bernoulli sample     C/W = 0.901042
+  Bloch XYZ hyperplane C/W = 0.908854
+  GW-style baseline    C/W = 0.915365
+
+seed=23:
+  direct+greedy        C/W = 0.893229
+  Bernoulli sample     C/W = 0.894531
+  Bloch XYZ hyperplane C/W = 0.897135
+  GW-style baseline    C/W = 0.916667
+
+seed=42:
+  direct+greedy        C/W = 0.902344
+  Bernoulli sample     C/W = 0.903646
+  Bloch XYZ hyperplane C/W = 0.903646
+  GW-style baseline    C/W = 0.925781
+
+seed=99:
+  direct+greedy        C/W = 0.899740
+  Bernoulli sample     C/W = 0.901042
+  Bloch XYZ hyperplane C/W = 0.903646
+  GW-style baseline    C/W = 0.914062
+```
+
+5 个 seed 均值：
+
+```text
+direct+greedy mean        C/W = 0.897135
+Bernoulli sample mean     C/W = 0.898958
+Bloch hyperplane mean     C/W = 0.902604
+GW-style baseline mean    C/W = 0.917448
+```
+
+判断：
+
+```text
+1. 当前隐藏 Bloch 向量确实含有独立概率读出没有利用到的相关结构。
+2. Bloch XYZ hyperplane 比 Bernoulli sample 稳定更强，尤其 seed=7/11/99。
+3. 8192 hyperplanes 对 seed=7/11 没有超过 1024 hyperplanes 的最好值，说明主要瓶颈不是采样数，而是 Bloch 向量本身。
+4. 这条路线最接近 GW，因为它与 GW 的“向量 + 超平面舍入”机制同构，但向量来自 SQNN 动力学。
+5. 下一阶段最有潜力的方向：训练时显式改善 Bloch 向量的相关结构，同时保持 Z-basis 测量主线；也就是让 SQNN 的隐藏相位向量更像可舍入的 GW-like embedding。
+```
+
+#### 18.29.30 Small vector auxiliary loss negative result
+
+基于 Bloch hyperplane readout 的正结果，测试一个很小的 auxiliary vector loss：
+
+```text
+loss = (1 - vector_weight) * normalized_energy
+       - vector_weight * vector_ratio
+       - entropy_weight * entropy
+       + J_penalty
+
+vector_weight = 0.02 或 0.05
+```
+
+注意：该实验明确不属于纯 Z-basis 主线，只是验证“直接把 full-vector anti-alignment 放进损失”是否有用。
+
+输出位置：
+
+```text
+outputs/vec_s7/
+outputs/bloch_readout_vec_s7/
+```
+
+seed=7 结果：
+
+```text
+default mix025:
+  direct+greedy C/W        = 0.891927
+  Bloch hyperplane C/W     = 0.899740
+  vector_best_ratio        = 0.872375 左右
+
+vector_weight=0.02:
+  direct+greedy C/W        = 0.890625
+  sample+greedy C/W        = 0.891927
+  Bloch hyperplane C/W     = 0.894531
+  vector_best_ratio        = 0.864586
+
+vector_weight=0.05:
+  direct+greedy C/W        = 0.886719
+  sample+greedy C/W        = 0.888021
+  vector_best_ratio        = 0.862391
+```
+
+判断：
+
+```text
+1. 粗暴加入 full-vector auxiliary loss 会降低 direct、sample、Bloch hyperplane 三类读出。
+2. 这说明“接近 GW”不能靠直接把 GW-like vector objective 塞进现有 loss。
+3. 更合理的方向是结构性地改相位/边消息，让 Bloch 向量自然形成可舍入相关结构。
+4. full-vector auxiliary loss 暂时封存，不进入主线。
+```
+
+#### 18.29.31 Edge-cavity XY plus Z-mix negative result
+
+测试一个更结构化的相位改法：
+
+```text
+phase_mode = memory_xy_feedback_edge_cavity_xy_z_edge_mix025_collapse
+```
+
+含义：
+
+```text
+1. Z-edge mix025 继续负责 Z-basis collapse。
+2. edge_cavity_xy torque 额外进入 RZ phase update，用来尝试增强隐藏 Bloch 向量的边相关结构。
+3. 不改主损失，不加入 vector auxiliary loss。
+```
+
+输出位置：
+
+```text
+outputs/edgecav_zmix_s7/
+```
+
+seed=7 结果：
+
+```text
+default mix025:
+  direct+greedy C/W = 0.891927
+  sample+greedy C/W = 0.894531
+  Bloch hyperplane C/W = 0.899740
+
+edgecavity_zmix phase03:
+  direct+greedy C/W = 0.873698
+  sample+greedy C/W = 0.877604
+
+edgecavity_zmix phase06:
+  direct+greedy C/W = 0.878906
+  sample+greedy C/W = 0.882812
+```
+
+判断：
+
+```text
+1. 简单叠加 edge_cavity_xy torque 会明显破坏 Z-edge collapse。
+2. 隐藏向量相关结构不能靠直接加 XY cavity torque 得到。
+3. 后续如果做相位相关结构，需要更受控的耦合方式，例如只作用于 readout embedding、
+   或用单独的 edge phase memory，而不是直接叠加到主 RZ 更新。
+4. 该分支封存，不进入主线。
+```
+
+#### 18.29.32 n=1024 V14 scale check
+
+在当前 V14 phase-aware 路线下补一个轻量 n=1024 random 3-regular MaxCut 初测。
+
+配置：
+
+```text
+n = 1024
+degree = 3
+seed = 17
+phase = v14_memory_xy_z_edge_gain_schedule_1p0_1p4_collapse
+rounds = 260
+epochs = 90
+```
+
+输出位置：
+
+```text
+outputs/v14_n1024_s17/
+outputs/bloch_readout_n1024_s17/
+```
+
+结果：
+
+```text
+expected C/W                 = 0.866201
+direct+1-bit greedy C/W      = 0.888672
+Bernoulli sample+greedy C/W  = 0.889323
+Bloch XYZ hyperplane C/W     = 0.889974
+
+residual active variables    = 32
+max residual component       = 3
+```
+
+判断：
+
+```text
+1. n=1024 上当前 V14 轻量配置能接近 0.89 C/W。
+2. Bloch hyperplane 仍有提升，但提升幅度远小于 n=512 的 seed=7/11。
+3. 这不是完整 n=1024 结论，因为只跑了一个 seed、一个路线、较短 epochs。
+4. 后续需要对 n=1024 单独做 gain/schedule/route 和 Bloch readout 调参，不能直接套 n=512 最优配置。
+```

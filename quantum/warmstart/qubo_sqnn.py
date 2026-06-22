@@ -564,6 +564,9 @@ class QUBOSynchronousLocalFieldSQNN(nn.Module):
         mixer_bias_init=0.0,
         monotone_accept=True,
         normalize_local_field=True,
+        symmetry_breaking="none",
+        symmetry_strength=0.0,
+        symmetry_seed=0,
     ):
         super().__init__()
         self.num_variables = int(num_variables)
@@ -573,6 +576,9 @@ class QUBOSynchronousLocalFieldSQNN(nn.Module):
         self.noise_config = noise_config
         self.monotone_accept = bool(monotone_accept)
         self.normalize_local_field = bool(normalize_local_field)
+        self.symmetry_breaking = str(symmetry_breaking)
+        self.symmetry_strength = float(symmetry_strength)
+        self.symmetry_seed = int(symmetry_seed)
 
         self.field_steps = nn.Parameter(
             torch.full((self.message_rounds,), float(step_init))
@@ -608,7 +614,31 @@ class QUBOSynchronousLocalFieldSQNN(nn.Module):
         angles = self.initial_angles.to(dtype=self.dtype, device=self.device).expand(
             problem.num_variables,
             -1,
-        )
+        ).clone()
+        if self.symmetry_breaking != "none" and self.symmetry_strength > 0.0:
+            gen = torch.Generator(device="cpu")
+            gen.manual_seed(self.symmetry_seed)
+            mode = "random_ry" if self.symmetry_breaking == "random_z" else self.symmetry_breaking
+            strength = torch.as_tensor(
+                self.symmetry_strength,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            if mode in {"random_ry", "random_rz", "random_rz_ry"}:
+                if mode in {"random_ry", "random_rz_ry"}:
+                    noise = 2.0 * torch.rand(problem.num_variables, generator=gen) - 1.0
+                    angles[:, 1] = angles[:, 1] + strength * noise.to(
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                if mode in {"random_rz", "random_rz_ry"}:
+                    noise = 2.0 * torch.rand(problem.num_variables, generator=gen) - 1.0
+                    angles[:, 0] = angles[:, 0] + strength * noise.to(
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+            else:
+                raise ValueError(f"unknown symmetry_breaking: {self.symmetry_breaking}")
         return _apply_bloch_rotation(bloch, angles)
 
     def _local_field(self, problem, probabilities):

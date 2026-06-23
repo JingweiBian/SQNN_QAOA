@@ -2,7 +2,7 @@
 
 """Scaling study for V10 and V14/Clean-ZEdge on random 3-regular MaxCut.
 
-Default scale grid uses powers of two: 512, 1024, 2048, 4096.  Each size uses
+Default scale grid uses powers of two from 512 through 16384.  Each size uses
 ten random graph seeds by default.  Reported ratios are cut fractions C/W,
 where W is the total edge weight, not strict C/C*.
 """
@@ -23,9 +23,12 @@ SCRIPTS_DIR = ROOT_DIR / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-import matplotlib.pyplot as plt
 import pandas as pd
 import torch
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    plt = None
 
 from maxcut3_compare import (  # noqa: E402
     gw_style_baselines,
@@ -40,7 +43,6 @@ from quantum.warmstart import (  # noqa: E402
     bernoulli_entropy,
     greedy_local_search,
     make_random_regular_maxcut,
-    sample_bernoulli,
 )
 
 
@@ -94,10 +96,53 @@ def configure_device(args: argparse.Namespace) -> torch.device:
     if int(args.cpu_threads) > 0:
         torch.set_num_threads(int(args.cpu_threads))
     if str(args.device) == "cuda" and torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        allow_tf32 = not bool(args.disable_tf32)
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+        torch.backends.cudnn.benchmark = not bool(args.disable_cudnn_benchmark)
+        try:
+            torch.set_float32_matmul_precision("high" if allow_tf32 else "highest")
+        except AttributeError:
+            pass
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+def synchronize_device(device: torch.device) -> None:
+    if torch.device(device).type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def apply_cuda_high_throughput_preset(args: argparse.Namespace) -> None:
+    """Raise batch sizes/work per launch to keep large GPUs busier."""
+    if not bool(args.cuda_high_throughput) and not bool(args.cuda_saturate):
+        return
+    if bool(args.cuda_saturate):
+        args.gw_rank = max(int(args.gw_rank), 512)
+        args.gw_steps = max(int(args.gw_steps), 4800)
+        args.gw_restarts = max(int(args.gw_restarts), 8)
+        args.gw_rounding_samples = max(int(args.gw_rounding_samples), 131072)
+        args.gw_rounding_batch_size = max(int(args.gw_rounding_batch_size), 8192)
+        args.random_flip_samples = max(int(args.random_flip_samples), 131072)
+        args.random_flip_batch_size = max(int(args.random_flip_batch_size), 16384)
+        args.sample_count = max(int(args.sample_count), 4096)
+        args.v10_symmetry_trials = max(int(args.v10_symmetry_trials), 16)
+        args.score_stride = max(int(args.score_stride), 10)
+        args.score_top_k_expected = max(int(args.score_top_k_expected), 24)
+        args.score_sample_round_batch = max(int(args.score_sample_round_batch), 4)
+        return
+    args.gw_rank = max(int(args.gw_rank), 256)
+    args.gw_steps = max(int(args.gw_steps), 3000)
+    args.gw_restarts = max(int(args.gw_restarts), 6)
+    args.gw_rounding_samples = max(int(args.gw_rounding_samples), 65536)
+    args.gw_rounding_batch_size = max(int(args.gw_rounding_batch_size), 4096)
+    args.random_flip_samples = max(int(args.random_flip_samples), 65536)
+    args.random_flip_batch_size = max(int(args.random_flip_batch_size), 8192)
+    args.sample_count = max(int(args.sample_count), 2048)
+    args.v10_symmetry_trials = max(int(args.v10_symmetry_trials), 12)
+    args.score_stride = max(int(args.score_stride), 8)
+    args.score_top_k_expected = max(int(args.score_top_k_expected), 20)
+    args.score_sample_round_batch = max(int(args.score_sample_round_batch), 3)
 
 
 def make_benchmark(n: int, degree: int, seed: int, device: torch.device):
@@ -209,6 +254,10 @@ def train_v10_trial(args: argparse.Namespace, benchmark, device: torch.device, s
     best_state = None
     best_score = -math.inf
     history = []
+    status = "ok"
+    stalled_epoch = None
+    stalled_reason = ""
+    synchronize_device(device)
     start = time.perf_counter()
     for epoch in range(int(args.v10_epochs)):
         optimizer.zero_grad(set_to_none=True)
@@ -220,9 +269,8 @@ def train_v10_trial(args: argparse.Namespace, benchmark, device: torch.device, s
         progress = epoch / max(int(args.v10_epochs) - 1, 1)
         entropy_weight = float(args.entropy_weight) * (1.0 - progress) + float(args.final_entropy_weight) * progress
         loss = -ratio - entropy_weight * entropy
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_([field_steps, phase_steps, mixer_bias], float(args.grad_clip))
         score = float(ratio.detach().cpu())
+        accepted_round_count = int(sum(bool(item) for item in state["accepted_rounds"]))
         if score > best_score:
             best_score = score
             best_state = {
@@ -230,21 +278,49 @@ def train_v10_trial(args: argparse.Namespace, benchmark, device: torch.device, s
                 "phase_steps": phase_steps.detach().clone(),
                 "mixer_bias": mixer_bias.detach().clone(),
             }
-        optimizer.step()
-        if epoch == 0 or epoch == int(args.v10_epochs) - 1 or (epoch + 1) % max(int(args.log_every), 1) == 0:
+        if not loss.requires_grad:
+            status = "stalled_no_grad"
+            stalled_epoch = int(epoch)
+            stalled_reason = "monotone_accept_rejected_all_differentiable_updates"
             history.append(
                 {
                     "epoch": int(epoch),
+                    "status": status,
                     "loss": float(loss.detach().cpu()),
                     "final_expected_C_over_W": score,
                     "entropy": float(entropy.detach().cpu()),
+                    "accepted_round_count": accepted_round_count,
                     "field_step_mean": float(field_steps.detach().mean().cpu()),
                     "phase_step_mean": float(phase_steps.detach().mean().cpu()),
                     "mixer_bias_mean": float(mixer_bias.detach().mean().cpu()),
                 }
             )
+            break
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_([field_steps, phase_steps, mixer_bias], float(args.grad_clip))
+        optimizer.step()
+        if epoch == 0 or epoch == int(args.v10_epochs) - 1 or (epoch + 1) % max(int(args.log_every), 1) == 0:
+            history.append(
+                {
+                    "epoch": int(epoch),
+                    "status": "ok",
+                    "loss": float(loss.detach().cpu()),
+                    "final_expected_C_over_W": score,
+                    "entropy": float(entropy.detach().cpu()),
+                    "accepted_round_count": accepted_round_count,
+                    "field_step_mean": float(field_steps.detach().mean().cpu()),
+                    "phase_step_mean": float(phase_steps.detach().mean().cpu()),
+                    "mixer_bias_mean": float(mixer_bias.detach().mean().cpu()),
+                }
+            )
+    synchronize_device(device)
     seconds = time.perf_counter() - start
-    assert best_state is not None
+    if best_state is None:
+        best_state = {
+            "field_steps": field_steps.detach().clone(),
+            "phase_steps": phase_steps.detach().clone(),
+            "mixer_bias": mixer_bias.detach().clone(),
+        }
     final_state = v10_forward(
         problem,
         initial_bloch,
@@ -259,33 +335,99 @@ def train_v10_trial(args: argparse.Namespace, benchmark, device: torch.device, s
         "history": history,
         "best_final_expected_C_over_W": best_score,
         "symmetry_seed": int(symmetry_seed),
+        "status": status,
+        "stalled_epoch": stalled_epoch,
+        "stalled_reason": stalled_reason,
         "parameters": {key: value.detach().cpu().tolist() for key, value in best_state.items()},
     }
+
+
+def select_score_rounds(args: argparse.Namespace, energy_trace: torch.Tensor) -> list[int]:
+    total_rounds = int(energy_trace.shape[0]) - 1
+    if total_rounds <= 0:
+        return []
+
+    stride = max(1, int(args.score_stride))
+    if stride <= 1:
+        rounds = set(range(1, total_rounds + 1))
+    else:
+        rounds = {1, total_rounds}
+        rounds.update(range(stride, total_rounds + 1, stride))
+
+    top_k = min(max(int(args.score_top_k_expected), 0), total_rounds)
+    if top_k:
+        with torch.no_grad():
+            expected_cut = (-energy_trace[1:]).detach().flatten()
+            _, indices = torch.topk(expected_cut, k=top_k)
+        rounds.update(int(item) + 1 for item in indices.detach().cpu().tolist())
+    return sorted(rounds)
+
+
+def sample_best_cuts_for_rounds(
+    args: argparse.Namespace,
+    benchmark,
+    probabilities_by_round: torch.Tensor,
+    seed: int,
+    trial: int | None,
+) -> torch.Tensor:
+    sample_count = int(args.sample_count)
+    round_count = int(probabilities_by_round.shape[0])
+    if sample_count <= 0 or round_count == 0:
+        return torch.full(
+            (round_count,),
+            float("nan"),
+            dtype=benchmark.problem.linear.dtype,
+            device=benchmark.problem.linear.device,
+        )
+
+    device = benchmark.problem.linear.device
+    dtype = benchmark.problem.linear.dtype
+    sample_gen = torch.Generator(device=device)
+    sample_gen.manual_seed(int(seed) * 1000003 + (trial or 0) * 7919 + 17)
+    round_batch = max(1, int(args.score_sample_round_batch))
+    best_chunks = []
+    for start in range(0, round_count, round_batch):
+        probabilities = probabilities_by_round[start : start + round_batch].detach()
+        active_rounds, n = probabilities.shape
+        expanded = probabilities.unsqueeze(1).expand(active_rounds, sample_count, n)
+        samples = torch.bernoulli(
+            expanded.reshape(active_rounds * sample_count, n),
+            generator=sample_gen,
+        ).to(dtype=dtype, device=device)
+        cuts = benchmark.cut_value(samples).reshape(active_rounds, sample_count)
+        best_chunks.append(cuts.max(dim=1).values)
+    return torch.cat(best_chunks, dim=0)
 
 
 def score_probability_trace(args: argparse.Namespace, benchmark, state: dict, model_name: str, n: int, seed: int, trial: int | None):
     problem = benchmark.problem
     device = problem.linear.device
     total_weight = float(benchmark.edge_weight.sum().detach().cpu())
-    sample_gen = torch.Generator(device=device)
-    sample_gen.manual_seed(int(seed) * 1000003 + (trial or 0) * 7919 + 17)
     rows = []
     probability_trace = state["probability_trace"]
     energy_trace = state["energy_trace"]
-    for round_index in range(1, int(probability_trace.shape[0])):
-        probabilities = probability_trace[round_index].detach()
-        expected_cut = float((-energy_trace[round_index]).detach().cpu())
-        direct = (probabilities >= 0.5).to(dtype=problem.linear.dtype)
-        direct_cut = float(benchmark.cut_value(direct).detach().cpu())
+    round_indices = select_score_rounds(args, energy_trace)
+    if not round_indices:
+        return rows
+
+    round_tensor = torch.as_tensor(round_indices, dtype=torch.long, device=device)
+    probabilities_by_round = probability_trace.index_select(0, round_tensor).detach()
+    expected_cuts = (-energy_trace.index_select(0, round_tensor)).detach()
+    direct_by_round = (probabilities_by_round >= 0.5).to(dtype=problem.linear.dtype)
+    direct_cuts = benchmark.cut_value(direct_by_round).detach()
+    sample_cuts = sample_best_cuts_for_rounds(args, benchmark, probabilities_by_round, seed, trial).detach()
+
+    expected_cuts_cpu = expected_cuts.cpu().tolist()
+    direct_cuts_cpu = direct_cuts.cpu().tolist()
+    sample_cuts_cpu = sample_cuts.cpu().tolist()
+
+    for row_index, round_index in enumerate(round_indices):
+        direct = direct_by_round[row_index]
+        expected_cut = float(expected_cuts_cpu[row_index])
+        direct_cut = float(direct_cuts_cpu[row_index])
         greedy_bits, _, _ = greedy_local_search(problem, direct, max_passes=int(args.greedy_passes))
         direct_greedy_cut = float(benchmark.cut_value(greedy_bits).detach().cpu())
-        sample_cut = float("nan")
-        if int(args.sample_count) > 0:
-            samples = sample_bernoulli(probabilities, num_samples=int(args.sample_count), generator=sample_gen).to(
-                dtype=problem.linear.dtype,
-                device=device,
-            )
-            sample_cut = float(torch.max(benchmark.cut_value(samples)).detach().cpu())
+        sample_cut = float(sample_cuts_cpu[row_index])
         rows.append(
             {
                 "n": int(n),
@@ -315,10 +457,21 @@ def best_metric_rows(round_rows: list[dict]) -> dict:
         column = f"{metric}_over_W" if metric == "expected" else f"{metric}_over_W"
         if metric == "expected":
             column = "expected_C_over_W"
-        row = frame.loc[frame[column].idxmax()]
-        out[f"best_{metric}_round"] = int(row["round"])
-        out[f"best_{metric}"] = float(row[metric if metric != "expected" else "expected_C"])
-        out[f"best_{metric}_over_W"] = float(row[column])
+        if column not in frame:
+            out[f"best_{metric}_round"] = ""
+            out[f"best_{metric}"] = float("nan")
+            out[f"best_{metric}_over_W"] = float("nan")
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce")
+        if values.notna().any():
+            row = frame.loc[values.idxmax()]
+            out[f"best_{metric}_round"] = int(row["round"])
+            out[f"best_{metric}"] = float(row[metric if metric != "expected" else "expected_C"])
+            out[f"best_{metric}_over_W"] = float(row[column])
+        else:
+            out[f"best_{metric}_round"] = ""
+            out[f"best_{metric}"] = float("nan")
+            out[f"best_{metric}_over_W"] = float("nan")
     return out
 
 
@@ -366,6 +519,7 @@ def load_or_run_gw(
             lr=float(args.gw_lr),
             restarts=int(args.gw_restarts),
             rounding_samples=int(args.gw_rounding_samples),
+            rounding_batch_size=int(args.gw_rounding_batch_size),
             greedy_passes=int(args.greedy_passes),
             seed=int(seed),
             device=device,
@@ -523,7 +677,10 @@ def run_v10(args: argparse.Namespace, n: int, seed: int, device: torch.device, o
                 "seed": int(seed),
                 "trial": int(trial),
                 "symmetry_seed": int(symmetry_seed),
-        "seconds": float(result["seconds"]),
+                "seconds": float(result["seconds"]),
+                "status": result.get("status", "ok"),
+                "stalled_epoch": result.get("stalled_epoch"),
+                "stalled_reason": result.get("stalled_reason", ""),
                 "best_final_expected_C_over_W": float(result["best_final_expected_C_over_W"]),
                 "best_metrics": best_metric_rows(rows),
                 "history": result["history"],
@@ -540,15 +697,28 @@ def run_v10(args: argparse.Namespace, n: int, seed: int, device: torch.device, o
                 "trial": int(trial),
                 "symmetry_seed": int(metrics.get("symmetry_seed", symmetry_seed)),
                 "seconds": float(metrics.get("seconds", float("nan"))),
+                "status": metrics.get("status", "ok"),
+                "stalled_epoch": metrics.get("stalled_epoch", ""),
+                "stalled_reason": metrics.get("stalled_reason", ""),
             }
         )
         trial_summaries.append(trial_summary)
     best = best_metric_rows(all_round_rows)
+    stalled_trials = sum(1 for item in trial_summaries if item.get("status") == "stalled_no_grad")
+    if stalled_trials == 0:
+        status = "ok"
+    elif stalled_trials == len(trial_summaries):
+        status = "stalled_no_grad"
+    else:
+        status = "partial_stalled_no_grad"
     summary = {
         "n": int(n),
         "seed": int(seed),
         "model": V10_MODEL,
         "trial_count": int(args.v10_symmetry_trials),
+        "ok_trial_count": int(len(trial_summaries) - stalled_trials),
+        "stalled_trial_count": int(stalled_trials),
+        "status": status,
         "model_seconds": float(sum(item.get("seconds", 0.0) for item in trial_summaries)),
         **best,
     }
@@ -574,10 +744,12 @@ def run_v14(args: argparse.Namespace, n: int, seed: int, device: torch.device, o
     )
     config["num_samples"] = int(args.sample_count)
     config["local_search_passes"] = int(args.greedy_passes)
+    synchronize_device(device)
     start = time.perf_counter()
     model, benchmark = load_trained_model(config, model_dir / "training", device)
     with torch.no_grad():
         state = model(benchmark.problem, return_state=True)
+    synchronize_device(device)
     rows = score_probability_trace(args, benchmark, state, V14_MODEL, n, seed, None)
     summary = {
         "n": int(n),
@@ -646,6 +818,13 @@ def aggregate(summary: pd.DataFrame) -> pd.DataFrame:
 
 
 def plot_scaling(agg: pd.DataFrame, output_dir: Path) -> None:
+    if plt is None:
+        return
+    if agg.empty or "n" not in agg:
+        return
+    positive_n = pd.to_numeric(agg["n"], errors="coerce") > 0
+    if not positive_n.any():
+        return
     plot_dir = output_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     metrics = [
@@ -689,20 +868,30 @@ def plot_scaling(agg: pd.DataFrame, output_dir: Path) -> None:
         plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(11, 6), dpi=160)
+    plotted_gap = False
     for model, group in agg.groupby("model", sort=True):
         group = group.sort_values("n")
-        ax.plot(group["n"], group["expected_gap_to_b1_mean"], marker="s", linestyle=":", label=f"{model} C[p] - b1")
-        ax.plot(group["n"], group["C_d_gap_to_b1_mean"], marker="o", label=f"{model} C_d - b1")
-        ax.plot(group["n"], group["C_s_gap_to_b1_mean"], marker="^", linestyle="--", label=f"{model} C_s - b1")
-    ax.axhline(0.0, color="black", linestyle="--", linewidth=1.0)
-    ax.set_xscale("log", base=2)
-    ax.set_xlabel("number of variables n")
-    ax.set_ylabel("mean gap to b1 GW expected")
-    ax.set_title("Scaling gap to b1 GW expected")
-    ax.grid(alpha=0.25)
-    ax.legend(fontsize=8, ncols=2)
-    fig.tight_layout()
-    fig.savefig(plot_dir / "scaling_gap_to_gw_expected.png")
+        for column, marker, linestyle, label in [
+            ("expected_gap_to_b1_mean", "s", ":", "C[p] - b1"),
+            ("C_d_gap_to_b1_mean", "o", "-", "C_d - b1"),
+            ("C_s_gap_to_b1_mean", "^", "--", "C_s - b1"),
+        ]:
+            values = pd.to_numeric(group[column], errors="coerce")
+            mask = values.notna() & (pd.to_numeric(group["n"], errors="coerce") > 0)
+            if not mask.any():
+                continue
+            ax.plot(group.loc[mask, "n"], values.loc[mask], marker=marker, linestyle=linestyle, label=f"{model} {label}")
+            plotted_gap = True
+    if plotted_gap:
+        ax.axhline(0.0, color="black", linestyle="--", linewidth=1.0)
+        ax.set_xscale("log", base=2)
+        ax.set_xlabel("number of variables n")
+        ax.set_ylabel("mean gap to b1 GW expected")
+        ax.set_title("Scaling gap to b1 GW expected")
+        ax.grid(alpha=0.25)
+        ax.legend(fontsize=8, ncols=2)
+        fig.tight_layout()
+        fig.savefig(plot_dir / "scaling_gap_to_gw_expected.png")
     plt.close(fig)
 
     win_rows = []
@@ -750,63 +939,71 @@ def plot_scaling(agg: pd.DataFrame, output_dir: Path) -> None:
     plt.close(fig)
 
 
-def threshold_events(agg: pd.DataFrame, metric: str) -> pd.DataFrame:
-    """Find the first tested size where V14 falls below each baseline."""
+def threshold_events(agg: pd.DataFrame, metric: str, model_names: list[str] | None = None) -> pd.DataFrame:
+    """Find the first tested size where each model falls below each baseline."""
     events = []
-    v14 = agg[agg["model"] == V14_MODEL].sort_values("n")
-    for baseline, label in BASELINES.items():
-        metric_col = f"{metric}_mean"
-        baseline_col = f"{baseline}_mean"
-        if metric_col not in v14.columns or baseline_col not in v14.columns:
-            events.append({"baseline": baseline, "label": label, "status": "missing_column"})
+    if model_names is None:
+        model_names = sorted(str(item) for item in agg["model"].dropna().unique())
+    for model_name in model_names:
+        model_frame = agg[agg["model"] == model_name].sort_values("n")
+        if model_frame.empty:
+            events.append({"model": model_name, "baseline": "", "label": "", "status": "model_missing"})
             continue
-        valid = v14[["n", "seed_count", metric_col, baseline_col]].copy()
-        valid[metric_col] = pd.to_numeric(valid[metric_col], errors="coerce")
-        valid[baseline_col] = pd.to_numeric(valid[baseline_col], errors="coerce")
-        valid = valid.dropna(subset=[metric_col, baseline_col]).sort_values("n")
-        if valid.empty:
-            events.append({"baseline": baseline, "label": label, "status": "baseline_missing"})
-            continue
-        previous_n = ""
-        found = False
-        for _, row in valid.iterrows():
-            n = int(row["n"])
-            value = float(row[metric_col])
-            baseline_value = float(row[baseline_col])
-            if value < baseline_value:
+        for baseline, label in BASELINES.items():
+            metric_col = f"{metric}_mean"
+            baseline_col = f"{baseline}_mean"
+            if metric_col not in model_frame.columns or baseline_col not in model_frame.columns:
+                events.append({"model": model_name, "baseline": baseline, "label": label, "status": "missing_column"})
+                continue
+            valid = model_frame[["n", "seed_count", metric_col, baseline_col]].copy()
+            valid[metric_col] = pd.to_numeric(valid[metric_col], errors="coerce")
+            valid[baseline_col] = pd.to_numeric(valid[baseline_col], errors="coerce")
+            valid = valid.dropna(subset=[metric_col, baseline_col]).sort_values("n")
+            if valid.empty:
+                events.append({"model": model_name, "baseline": baseline, "label": label, "status": "baseline_missing"})
+                continue
+            previous_n = ""
+            found = False
+            for _, row in valid.iterrows():
+                n = int(row["n"])
+                value = float(row[metric_col])
+                baseline_value = float(row[baseline_col])
+                if value < baseline_value:
+                    events.append(
+                        {
+                            "model": model_name,
+                            "baseline": baseline,
+                            "label": label,
+                            "status": "first_below",
+                            "metric": metric,
+                            "previous_tested_n": previous_n,
+                            "first_below_n": n,
+                            "model_metric_mean": value,
+                            "baseline_mean": baseline_value,
+                            "gap": value - baseline_value,
+                            "seed_count": int(row["seed_count"]),
+                        }
+                    )
+                    found = True
+                    break
+                previous_n = n
+            if not found:
+                last = valid.iloc[-1]
                 events.append(
                     {
+                        "model": model_name,
                         "baseline": baseline,
                         "label": label,
-                        "status": "first_below",
+                        "status": "not_found",
                         "metric": metric,
-                        "previous_tested_n": previous_n,
-                        "first_below_n": n,
-                        "v14_metric_mean": value,
-                        "baseline_mean": baseline_value,
-                        "gap": value - baseline_value,
-                        "seed_count": int(row["seed_count"]),
+                        "previous_tested_n": int(last["n"]),
+                        "first_below_n": "",
+                        "model_metric_mean": float(last[metric_col]),
+                        "baseline_mean": float(last[baseline_col]),
+                        "gap": float(last[metric_col]) - float(last[baseline_col]),
+                        "seed_count": int(last["seed_count"]),
                     }
                 )
-                found = True
-                break
-            previous_n = n
-        if not found:
-            last = valid.iloc[-1]
-            events.append(
-                {
-                    "baseline": baseline,
-                    "label": label,
-                    "status": "not_found",
-                    "metric": metric,
-                    "previous_tested_n": int(last["n"]),
-                    "first_below_n": "",
-                    "v14_metric_mean": float(last[metric_col]),
-                    "baseline_mean": float(last[baseline_col]),
-                    "gap": float(last[metric_col]) - float(last[baseline_col]),
-                    "seed_count": int(last["seed_count"]),
-                }
-            )
     return pd.DataFrame(events)
 
 
@@ -831,6 +1028,28 @@ def refine_sizes_from_events(events: pd.DataFrame, existing_sizes: list[int], st
                 out.add(value)
             value += int(step)
     return sorted(out)
+
+
+def unresolved_upper_bound_events(events: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    if events.empty:
+        return events
+    model_names = {MODEL_KEY[item] for item in args.models}
+    baselines = set(args.upper_bound_baselines)
+    selected = events[
+        events.get("model", pd.Series(dtype=object)).isin(model_names)
+        & events.get("baseline", pd.Series(dtype=object)).isin(baselines)
+    ].copy()
+    return selected[selected["status"] == "not_found"]
+
+
+def next_auto_extend_size(tested_sizes: list[int], args: argparse.Namespace) -> int | None:
+    if not tested_sizes:
+        return None
+    current = max(int(item) for item in tested_sizes)
+    if current >= int(args.max_auto_n):
+        return None
+    proposed = max(current + 1, int(math.ceil(current * float(args.auto_extend_factor))))
+    return min(proposed, int(args.max_auto_n))
 
 
 def fmt(value, digits: int = 6) -> str:
@@ -863,7 +1082,11 @@ def write_report(
         f"- degree: `{args.degree}`",
         f"- sample count for C_s: `{args.sample_count}`",
         f"- default scale step: `{args.size_mode}`",
-        f"- threshold metric for V14: `{args.threshold_metric}`",
+        f"- threshold metric: `{args.threshold_metric}`",
+        f"- upper-bound baselines: `{', '.join(args.upper_bound_baselines)}`",
+        f"- score stride / top expected rounds: `{args.score_stride}` / `{args.score_top_k_expected}`",
+        f"- CUDA high-throughput preset: `{bool(args.cuda_high_throughput)}`",
+        f"- CUDA saturate preset: `{bool(args.cuda_saturate)}`",
         f"- classical time limit per baseline/graph: `{args.classical_time_limit_seconds}` seconds",
         f"- device used by PyTorch: `{summary['device'].iloc[0] if 'device' in summary.columns and not summary.empty else args.device}`",
         "",
@@ -880,14 +1103,14 @@ def write_report(
             f"{int(row['C_d_wins_vs_b1'])}/{int(row['seed_count'])} | "
             f"{int(row['C_d_wins_vs_b2'])}/{int(row['seed_count'])} |"
         )
-    lines.extend(["", "## V14 First-Below Events", ""])
-    lines.append("| baseline | status | previous tested n | first below n | V14 metric | baseline | gap |")
-    lines.append("|---|---|---:|---:|---:|---:|---:|")
+    lines.extend(["", "## First-Below Events", ""])
+    lines.append("| model | baseline | status | previous tested n | first below n | model metric | baseline | gap |")
+    lines.append("|---|---|---|---:|---:|---:|---:|---:|")
     for _, row in threshold_frame.iterrows():
         lines.append(
-            f"| `{row.get('baseline', '')}` {row.get('label', '')} | {row.get('status', '')} | "
+            f"| `{row.get('model', '')}` | `{row.get('baseline', '')}` {row.get('label', '')} | {row.get('status', '')} | "
             f"{row.get('previous_tested_n', '')} | {row.get('first_below_n', '')} | "
-            f"{fmt(row.get('v14_metric_mean', ''))} | {fmt(row.get('baseline_mean', ''))} | {fmt(row.get('gap', ''))} |"
+            f"{fmt(row.get('model_metric_mean', ''))} | {fmt(row.get('baseline_mean', ''))} | {fmt(row.get('gap', ''))} |"
         )
     lines.extend(["", "## Runtime Means", ""])
     lines.append("| n | model | model sec | b1/b2 sec | b3 sec | b4 sec |")
@@ -905,16 +1128,23 @@ def write_report(
             "- `tables/seed_summary.csv`: one row per n/seed/model.",
             "- `tables/round_metrics.csv`: one row per n/seed/model/round.",
             "- `tables/aggregate_by_n.csv`: mean/std/win counts by n and model.",
-            "- `plots/scaling_C_d_vs_n.png`",
-            "- `plots/scaling_C_dg_vs_n.png`",
-            "- `plots/scaling_C_s_vs_n.png`",
-            "- `plots/scaling_expected_vs_n.png`",
-            "- `plots/scaling_gap_to_gw_expected.png`",
-            "- `plots/scaling_win_counts_vs_gw_expected.png`",
-            "- `plots/scaling_runtime_seconds.png`",
-            "- `tables/threshold_events.csv`: first tested n where V14 falls below each baseline.",
+            "- `tables/threshold_events.csv`: first tested n where each model falls below each baseline.",
         ]
     )
+    if plt is None:
+        lines.append("- plots skipped because `matplotlib` is not installed in this Python environment.")
+    else:
+        lines.extend(
+            [
+                "- `plots/scaling_C_d_vs_n.png`",
+                "- `plots/scaling_C_dg_vs_n.png`",
+                "- `plots/scaling_C_s_vs_n.png`",
+                "- `plots/scaling_expected_vs_n.png`",
+                "- `plots/scaling_gap_to_gw_expected.png`",
+                "- `plots/scaling_win_counts_vs_gw_expected.png`",
+                "- `plots/scaling_runtime_seconds.png`",
+            ]
+        )
     (output_dir / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -922,7 +1152,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sizes", type=int, nargs="*", default=[])
     parser.add_argument("--min-n", type=int, default=512)
-    parser.add_argument("--max-n", type=int, default=4096)
+    parser.add_argument("--max-n", type=int, default=16384)
     parser.add_argument("--size-mode", choices=["doubling", "linear"], default="doubling")
     parser.add_argument("--step-n", type=int, default=512)
     parser.add_argument("--seeds", type=int, nargs="+", default=list(range(10)))
@@ -932,12 +1162,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--cpu-threads", type=int, default=0)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--disable-tf32", action="store_true")
+    parser.add_argument("--disable-cudnn-benchmark", action="store_true")
+    parser.add_argument(
+        "--cuda-high-throughput",
+        action="store_true",
+        help="Raise GPU-heavy batch sizes and reduce per-round scoring syncs.",
+    )
+    parser.add_argument(
+        "--cuda-saturate",
+        action="store_true",
+        help="Use a more aggressive GPU-saturation preset; expect much longer runs.",
+    )
 
     parser.add_argument("--gw-rank", type=int, default=64)
     parser.add_argument("--gw-steps", type=int, default=1200)
     parser.add_argument("--gw-lr", type=float, default=0.03)
     parser.add_argument("--gw-restarts", type=int, default=2)
     parser.add_argument("--gw-rounding-samples", type=int, default=4096)
+    parser.add_argument("--gw-rounding-batch-size", type=int, default=2048)
 
     parser.add_argument("--v10-rounds", type=int, default=100)
     parser.add_argument("--v10-epochs", type=int, default=200)
@@ -962,13 +1205,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v14-head-count", type=int, default=1)
 
     parser.add_argument("--sample-count", type=int, default=256)
+    parser.add_argument("--score-stride", type=int, default=1)
+    parser.add_argument("--score-top-k-expected", type=int, default=0)
+    parser.add_argument("--score-sample-round-batch", type=int, default=1)
     parser.add_argument("--greedy-passes", type=int, default=220)
     parser.add_argument("--random-flip-samples", type=int, default=1024)
     parser.add_argument("--random-flip-batch-size", type=int, default=256)
     parser.add_argument("--greedy-restarts", type=int, default=32)
     parser.add_argument("--classical-time-limit-seconds", type=float, default=3600.0)
     parser.add_argument("--adaptive-refine", action="store_true")
+    parser.add_argument("--adaptive-refine-passes", type=int, default=4)
     parser.add_argument("--refine-step-n", type=int, default=128)
+    parser.add_argument("--auto-extend", action="store_true")
+    parser.add_argument("--auto-extend-factor", type=float, default=2.0)
+    parser.add_argument("--max-auto-n", type=int, default=65536)
+    parser.add_argument(
+        "--upper-bound-baselines",
+        nargs="+",
+        choices=sorted(BASELINES),
+        default=["b1"],
+        help="Baselines whose first-below event defines an unresolved scale upper bound.",
+    )
     parser.add_argument(
         "--threshold-metric",
         choices=["expected", "C_d", "C_dg", "C_s"],
@@ -979,6 +1236,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    apply_cuda_high_throughput_preset(args)
     sizes = parse_sizes(args)
     device = configure_device(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1004,7 +1262,7 @@ def main() -> None:
         if summary.empty:
             return summary, rounds, pd.DataFrame(), pd.DataFrame()
         agg = aggregate(summary)
-        events = threshold_events(agg, str(args.threshold_metric))
+        events = threshold_events(agg, str(args.threshold_metric), [MODEL_KEY[item] for item in args.models])
         summary.to_csv(args.output_dir / "tables" / "seed_summary.csv", index=False)
         rounds.to_csv(args.output_dir / "tables" / "round_metrics.csv", index=False)
         agg.to_csv(args.output_dir / "tables" / "aggregate_by_n.csv", index=False)
@@ -1044,16 +1302,33 @@ def main() -> None:
                     round_rows.extend({**row, **baselines} for row in rows)
                 persist()
 
-    run_size_grid(sizes)
-    _, _, agg, events = persist()
-
-    if bool(args.adaptive_refine):
-        for _ in range(4):
-            extra_sizes = refine_sizes_from_events(events, sorted(set(tested_sizes)), int(args.refine_step_n))
+    def run_adaptive_refine(events: pd.DataFrame) -> pd.DataFrame:
+        if not bool(args.adaptive_refine):
+            return events
+        current_events = events
+        for _ in range(max(int(args.adaptive_refine_passes), 0)):
+            extra_sizes = refine_sizes_from_events(current_events, sorted(set(tested_sizes)), int(args.refine_step_n))
             if not extra_sizes:
                 break
             run_size_grid(extra_sizes)
+            _, _, _, current_events = persist()
+        return current_events
+
+    run_size_grid(sizes)
+    _, _, agg, events = persist()
+    events = run_adaptive_refine(events)
+
+    if bool(args.auto_extend):
+        while True:
+            unresolved = unresolved_upper_bound_events(events, args)
+            if unresolved.empty:
+                break
+            next_n = next_auto_extend_size(tested_sizes, args)
+            if next_n is None or next_n in set(tested_sizes):
+                break
+            run_size_grid([next_n])
             _, _, agg, events = persist()
+            events = run_adaptive_refine(events)
 
     persist()
 

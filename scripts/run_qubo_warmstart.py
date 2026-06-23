@@ -16,7 +16,11 @@ import time
 from pathlib import Path
 
 import torch
-from tqdm import trange
+try:
+    from tqdm import trange
+except ModuleNotFoundError:
+    def trange(*args, **kwargs):
+        return range(*args)
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:

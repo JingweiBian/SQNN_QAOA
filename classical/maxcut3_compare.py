@@ -46,18 +46,12 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from ortools.sat.python import cp_model
+try:
+    from ortools.sat.python import cp_model
+except ModuleNotFoundError:
+    cp_model = None
 
-from explore_j_regularized_sqnn import config_id, make_train_args
 from quantum.warmstart import batch_greedy_local_search, greedy_local_search, sample_bernoulli
-from run_maxcut3_phase_aware_probe import (
-    MultiHeadPhaseAwareSQNN,
-    PhaseAwareJRegularizedSQNN,
-    load_base_config,
-    train_phase_one,
-    with_updates,
-)
-from run_qubo_warmstart import make_benchmark
 
 
 @dataclass
@@ -84,6 +78,30 @@ class BaselineResult:
     cut_fraction: float
     seconds: float
     details: dict
+
+
+def phase_aware_symbols():
+    """Import V14 training helpers only when a V14 path actually needs them."""
+    from explore_j_regularized_sqnn import config_id, make_train_args
+    from run_maxcut3_phase_aware_probe import (
+        MultiHeadPhaseAwareSQNN,
+        PhaseAwareJRegularizedSQNN,
+        load_base_config,
+        train_phase_one,
+        with_updates,
+    )
+    from run_qubo_warmstart import make_benchmark
+
+    return {
+        "config_id": config_id,
+        "make_train_args": make_train_args,
+        "MultiHeadPhaseAwareSQNN": MultiHeadPhaseAwareSQNN,
+        "PhaseAwareJRegularizedSQNN": PhaseAwareJRegularizedSQNN,
+        "load_base_config": load_base_config,
+        "train_phase_one": train_phase_one,
+        "with_updates": with_updates,
+        "make_benchmark": make_benchmark,
+    }
 
 
 def make_edges(n: int, degree: int, seed: int) -> list[tuple[int, int]]:
@@ -113,6 +131,11 @@ def solve_maxcut_cp_sat(
     exact C*. Otherwise `cut_value` is the best incumbent and `upper_bound` is
     a certified bound from the search.
     """
+    if cp_model is None:
+        raise ModuleNotFoundError(
+            "OR-Tools is required for CP-SAT exact/bound runs. "
+            "Install `ortools` or use a workflow that only needs GW/SQNN scaling."
+        )
     model = cp_model.CpModel()
     x = [model.NewBoolVar(f"x_{i}") for i in range(int(n))]
     # MaxCut is invariant under flipping every bit. Fixing one node removes
@@ -208,6 +231,7 @@ def gw_style_baselines(
     greedy_passes: int,
     seed: int,
     device: str,
+    rounding_batch_size: int = 2048,
 ) -> tuple[BaselineResult, BaselineResult, BaselineResult]:
     """Run GW-style expected rounding plus sampled/greedy helper baselines."""
     start = time.perf_counter()
@@ -256,7 +280,7 @@ def gw_style_baselines(
     best_assignment = None
     best_cut = -1
     processed = 0
-    chunk = min(2048, int(rounding_samples))
+    chunk = min(max(1, int(rounding_batch_size)), int(rounding_samples))
     while processed < int(rounding_samples):
         count = min(chunk, int(rounding_samples) - processed)
         planes = torch.randn((count, int(rank)), dtype=dtype, device=device, generator=sample_gen)
@@ -286,6 +310,7 @@ def gw_style_baselines(
             "lr": float(lr),
             "restarts": int(restarts),
             "rounding_samples": int(rounding_samples),
+            "rounding_batch_size": int(rounding_batch_size),
             "sampled_best_cut": int(best_cut),
             "post_greedy_cut": int(greedy_cut),
             "relaxed_cut": float(best_relaxed),
@@ -304,6 +329,7 @@ def gw_style_baselines(
             "lr": float(lr),
             "restarts": int(restarts),
             "rounding_samples": int(rounding_samples),
+            "rounding_batch_size": int(rounding_batch_size),
             "expected_cut": float(expected_cut),
             "post_greedy_cut": int(greedy_cut),
             "relaxed_cut": float(best_relaxed),
@@ -321,6 +347,7 @@ def gw_style_baselines(
             "lr": float(lr),
             "restarts": int(restarts),
             "rounding_samples": int(rounding_samples),
+            "rounding_batch_size": int(rounding_batch_size),
             "pre_greedy_cut": int(best_cut),
             "expected_cut": float(expected_cut),
             "relaxed_cut": float(best_relaxed),
@@ -387,6 +414,9 @@ def best_v14_gain14_config(
     head_seed_stride: int = 7919,
 ) -> dict:
     """Build the current best named V14/Z-edge configuration."""
+    symbols = phase_aware_symbols()
+    load_base_config = symbols["load_base_config"]
+    with_updates = symbols["with_updates"]
     base = load_base_config(Path("outputs/maxcut3_15h_exploration"), "missing")
     config = with_updates(
         base,
@@ -453,6 +483,7 @@ def recommended_clean_edgeboost_config(
         head_count=head_count,
         head_seed_stride=head_seed_stride,
     )
+    with_updates = phase_aware_symbols()["with_updates"]
     return with_updates(
         base,
         phase=(
@@ -475,6 +506,9 @@ def recommended_clean_edgeboost_config(
 
 def build_phase_aware_model(config: dict, benchmark, device: torch.device):
     """Build the matching single-head or multi-head SQNN for a saved config."""
+    symbols = phase_aware_symbols()
+    MultiHeadPhaseAwareSQNN = symbols["MultiHeadPhaseAwareSQNN"]
+    PhaseAwareJRegularizedSQNN = symbols["PhaseAwareJRegularizedSQNN"]
     model_kwargs = dict(
         trust_mode=config.get("trust_mode", "fixed"),
         trust_shrink=float(config["trust_shrink"]),
@@ -527,8 +561,13 @@ def build_phase_aware_model(config: dict, benchmark, device: torch.device):
     ).to(device)
 
 
-def load_trained_model(config: dict, output_dir: Path, device: torch.device) -> tuple[PhaseAwareJRegularizedSQNN, object]:
+def load_trained_model(config: dict, output_dir: Path, device: torch.device) -> tuple[object, object]:
     """Train/reuse the SQNN run, then load the saved model object."""
+    symbols = phase_aware_symbols()
+    config_id = symbols["config_id"]
+    make_train_args = symbols["make_train_args"]
+    train_phase_one = symbols["train_phase_one"]
+    make_benchmark = symbols["make_benchmark"]
     train_phase_one(config, device, output_dir)
     run_id = config_id(config)
     payload = torch.load(output_dir / "runs" / run_id / "model.pt", map_location=device, weights_only=False)

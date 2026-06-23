@@ -221,14 +221,14 @@ def load_or_run_gw_expected(args: argparse.Namespace, edges: list[tuple[int, int
     cache_path = Path(args.gw_cache_dir) / f"seed_{seed}" / "gw_style.json" if args.gw_cache_dir else None
 
     if local_path.exists() and not args.force_gw:
-        expected, _ = load_gw_style_results(local_path, total_weight)
+        expected, _, _ = load_gw_style_results(local_path, total_weight)
         return expected
     if cache_path is not None and cache_path.exists() and not args.force_gw:
-        expected, sampled_best = load_gw_style_results(cache_path, total_weight)
-        write_gw_style_results(local_path, expected, sampled_best)
+        expected, sampled_best, plus_greedy = load_gw_style_results(cache_path, total_weight)
+        write_gw_style_results(local_path, expected, sampled_best, plus_greedy)
         return expected
 
-    expected, sampled_best = gw_style_baselines(
+    expected, sampled_best, plus_greedy = gw_style_baselines(
         edges,
         int(args.n),
         rank=int(args.gw_rank),
@@ -236,10 +236,11 @@ def load_or_run_gw_expected(args: argparse.Namespace, edges: list[tuple[int, int
         lr=float(args.gw_lr),
         restarts=int(args.gw_restarts),
         rounding_samples=int(args.gw_rounding_samples),
+        greedy_passes=int(args.greedy_passes),
         seed=int(seed),
         device=args.device,
     )
-    write_gw_style_results(local_path, expected, sampled_best)
+    write_gw_style_results(local_path, expected, sampled_best, plus_greedy)
     return expected
 
 

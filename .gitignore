@@ -1,8 +1,8 @@
 .venv/
+.tools/
 outputs/
 article/
 articles/
-sqnnqaoa/
 .matplotlib/
 
 __pycache__/

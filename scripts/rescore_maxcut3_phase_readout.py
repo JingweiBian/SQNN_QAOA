@@ -19,7 +19,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from explore_j_regularized_sqnn import load_summary, make_train_args  # noqa: E402
 from quantum.warmstart import greedy_local_search, sample_bernoulli  # noqa: E402
-from quantum.warmstart.phase_aware_sqnn import MultiHeadPhaseAwareSQNN, PhaseAwareJRegularizedSQNN  # noqa: E402
+from run_maxcut3_phase_aware_probe import MultiHeadPhaseAwareSQNN, PhaseAwareJRegularizedSQNN  # noqa: E402
 from run_qubo_warmstart import make_benchmark, ratio_value  # noqa: E402
 
 
@@ -56,6 +56,8 @@ def build_phase_model(config, problem, device):
         phase_mode=config.get("phase_mode", "baseline"),
         phase_memory_decay=float(config.get("phase_memory_decay", 0.0)),
         xy_feedback_init=float(config.get("xy_feedback_init", 0.0)),
+        xy_feedback_active_fraction=float(config.get("xy_feedback_active_fraction", 1.0)),
+        xy_feedback_decay_fraction=float(config.get("xy_feedback_decay_fraction", 0.0)),
         omega_init=float(config.get("omega_init", 0.0)),
         neighbor_phase_init=float(config.get("neighbor_phase_init", 0.0)),
         phase_diff_init=float(config.get("phase_diff_init", 0.0)),
@@ -73,6 +75,7 @@ def build_phase_model(config, problem, device):
         ),
         z_message_gain_schedule_start=float(config.get("z_message_gain_schedule_start", 0.60)),
         node_step_mode=config.get("node_step_mode", "none"),
+        rollback_aux_on_reject=as_bool(config.get("rollback_aux_on_reject"), False),
     )
     if int(config.get("head_count", 1)) > 1:
         return MultiHeadPhaseAwareSQNN(

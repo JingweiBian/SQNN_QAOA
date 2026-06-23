@@ -138,6 +138,7 @@ def run_baseline_if_needed(args, device):
             lr=float(args.gw_lr),
             restarts=int(args.gw_restarts),
             hyperplanes=int(args.gw_hyperplanes),
+            greedy_passes=int(args.baseline_greedy_passes),
             seed=int(args.seed) + 29,
             log_every=max(int(args.gw_steps) // 10, 1),
         ),
@@ -934,7 +935,7 @@ def plot_progress(output_dir, baseline_payload):
     if random_line is not None:
         axis.axhline(random_line, color="#999999", linestyle="--", linewidth=1.2, label="random+greedy baseline")
     if gw_line is not None:
-        axis.axhline(gw_line, color="#b00020", linestyle="--", linewidth=1.4, label="low-rank GW sampled-best")
+        axis.axhline(gw_line, color="#b00020", linestyle="--", linewidth=1.4, label="low-rank GW-style baseline")
     axis.axhline(0.90, color="#f58518", linestyle=":", linewidth=1.4, label="0.90 target")
     axis.axhline(0.95, color="#6f4e7c", linestyle=":", linewidth=1.4, label="0.95 stretch target")
     axis.set_xlabel("research cycle")

@@ -2,8 +2,10 @@
 
 """Evaluate the current SQNN model on multiple n=512 random 3-regular graphs.
 
-This script uses only the paper-aligned GW expected hyperplane value as the
-classical baseline.
+This script uses the paper-aligned GW expected hyperplane value as the main
+classical baseline and also plots the GW guarantee/lower-bound reference.
+GW sampled-best and GW+greedy may still be cached by the shared helper, but
+they are not reported or plotted here.
 """
 
 from __future__ import annotations
@@ -34,18 +36,21 @@ from maxcut3_compare import (
 from quantum.warmstart import greedy_local_search, sample_bernoulli
 
 
+ALPHA_GW = 0.8785672057848516
+
+
 def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def load_or_run_gw_expected(args: argparse.Namespace, edges: list[tuple[int, int]], output_dir: Path, seed: int):
-    """Return the GW expected baseline while keeping sampled GW out of reports."""
+    """Return GW expected and GW guarantee while keeping sampled GW out of reports."""
     gw_path = output_dir / "gw_style.json"
     total_weight = float(len(edges))
     if gw_path.exists() and not args.force_gw:
-        gw_expected, gw_sampled_best = load_gw_style_results(gw_path, total_weight)
+        gw_expected, gw_sampled_best, gw_plus_greedy = load_gw_style_results(gw_path, total_weight)
     else:
-        gw_expected, gw_sampled_best = gw_style_baselines(
+        gw_expected, gw_sampled_best, gw_plus_greedy = gw_style_baselines(
             edges,
             int(args.n),
             rank=int(args.gw_rank),
@@ -53,11 +58,15 @@ def load_or_run_gw_expected(args: argparse.Namespace, edges: list[tuple[int, int
             lr=float(args.gw_lr),
             restarts=int(args.gw_restarts),
             rounding_samples=int(args.gw_rounding_samples),
+            greedy_passes=int(args.greedy_passes),
             seed=int(seed),
             device=args.device,
         )
-        write_gw_style_results(gw_path, gw_expected, gw_sampled_best)
-    return gw_expected
+        write_gw_style_results(gw_path, gw_expected, gw_sampled_best, gw_plus_greedy)
+    relaxed_cut = float(gw_expected.details.get("relaxed_cut", float("nan")))
+    guarantee_cut = ALPHA_GW * relaxed_cut
+    guarantee_fraction = guarantee_cut / total_weight
+    return gw_expected, guarantee_cut, guarantee_fraction
 
 
 def sqnn_trace_for_seed(args: argparse.Namespace, seed: int, output_dir: Path, total_weight: float) -> tuple[pd.DataFrame, dict]:
@@ -129,13 +138,26 @@ def best_row(frame: pd.DataFrame, column: str) -> dict:
     return {"round": int(row["round"]), "cut": float(row[column]), "cut_fraction": float(row[column + "_fraction"])}
 
 
-def plot_seed_trace(frame: pd.DataFrame, gw_expected_fraction: float, output_dir: Path, seed: int) -> None:
+def plot_seed_trace(
+    frame: pd.DataFrame,
+    gw_expected_fraction: float,
+    gw_guarantee_fraction: float,
+    output_dir: Path,
+    seed: int,
+) -> None:
     fig, ax = plt.subplots(figsize=(11, 5), dpi=150)
     ax.plot(frame["round"], frame["expected_cut_fraction"], label="SQNN expected C[p]/W", linewidth=1.6)
     ax.plot(frame["round"], frame["direct_cut_fraction"], label="SQNN C_d", linewidth=1.5)
     ax.plot(frame["round"], frame["direct_greedy_cut_fraction"], label="SQNN C_dg", linewidth=1.5)
     ax.plot(frame["round"], frame["sample_cut_fraction"], label="SQNN C_s", linewidth=1.3)
     ax.axhline(gw_expected_fraction, color="black", linestyle="--", linewidth=1.9, label="GW expected")
+    ax.axhline(
+        gw_guarantee_fraction,
+        color="#6b7280",
+        linestyle=":",
+        linewidth=1.7,
+        label="GW guarantee",
+    )
     ax.set_title(f"n=512 random 3-regular, seed={seed}")
     ax.set_xlabel("SQNN round")
     ax.set_ylabel("cut fraction C/W")
@@ -146,13 +168,26 @@ def plot_seed_trace(frame: pd.DataFrame, gw_expected_fraction: float, output_dir
     plt.close(fig)
 
 
-def plot_seed_energy(frame: pd.DataFrame, gw_expected_cut: float, output_dir: Path, seed: int) -> None:
+def plot_seed_energy(
+    frame: pd.DataFrame,
+    gw_expected_cut: float,
+    gw_guarantee_cut: float,
+    output_dir: Path,
+    seed: int,
+) -> None:
     fig, ax = plt.subplots(figsize=(11, 5), dpi=150)
     ax.plot(frame["round"], frame["expected_energy"], label="SQNN expected energy E[p]", linewidth=1.7)
     ax.plot(frame["round"], frame["direct_energy"], label="E_d = -C_d", alpha=0.75)
     ax.plot(frame["round"], frame["direct_greedy_energy"], label="E_dg = -C_dg", alpha=0.75)
     ax.plot(frame["round"], frame["sample_energy"], label="E_s = -C_s", alpha=0.75)
     ax.axhline(-gw_expected_cut, color="black", linestyle="--", linewidth=1.9, label="- GW expected")
+    ax.axhline(
+        -gw_guarantee_cut,
+        color="#6b7280",
+        linestyle=":",
+        linewidth=1.7,
+        label="- GW guarantee",
+    )
     ax.set_title(f"n=512 expected energy, seed={seed}")
     ax.set_xlabel("SQNN round")
     ax.set_ylabel("QUBO energy E = -cut")
@@ -169,6 +204,14 @@ def plot_aggregate(summary: pd.DataFrame, output_dir: Path) -> None:
 
     fig, ax = plt.subplots(figsize=(12, 5), dpi=150)
     ax.plot(x, summary["gw_expected_C_over_W"], marker="o", color="black", linestyle="--", label="GW expected")
+    ax.plot(
+        x,
+        summary["gw_guarantee_C_over_W"],
+        marker="o",
+        color="#6b7280",
+        linestyle=":",
+        label="GW guarantee",
+    )
     ax.plot(x, summary["sqnn_expected_C_over_W"], marker="o", label="SQNN expected C[p]")
     ax.plot(x, summary["sqnn_direct_C_over_W"], marker="o", label="SQNN C_d")
     ax.plot(x, summary["sqnn_direct_greedy_C_over_W"], marker="o", label="SQNN C_dg")
@@ -190,6 +233,14 @@ def plot_aggregate(summary: pd.DataFrame, output_dir: Path) -> None:
         ("sqnn_sample_C_over_W", "C_s - GW"),
     ]:
         ax.plot(x, summary[column] - summary["gw_expected_C_over_W"], marker="o", label=label)
+    ax.plot(
+        x,
+        summary["gw_guarantee_C_over_W"] - summary["gw_expected_C_over_W"],
+        marker="o",
+        color="#6b7280",
+        linestyle=":",
+        label="GW guarantee - GW expected",
+    )
     ax.axhline(0.0, color="black", linestyle="--", linewidth=1.2)
     ax.set_xticks(list(x), labels)
     ax.set_xlabel("random graph seed")
@@ -201,17 +252,24 @@ def plot_aggregate(summary: pd.DataFrame, output_dir: Path) -> None:
     plt.close(fig)
 
 
-def plot_small_multiples(output_dir: Path, seed_frames: list[tuple[int, pd.DataFrame, float]]) -> None:
+def plot_small_multiples(output_dir: Path, seed_frames: list[tuple[int, pd.DataFrame, float, float]]) -> None:
     cols = 2
     rows = math.ceil(len(seed_frames) / cols)
     fig, axes = plt.subplots(rows, cols, figsize=(13, 3.2 * rows), dpi=150, sharex=True, sharey=True)
     axes_list = list(axes.flat if hasattr(axes, "flat") else [axes])
-    for ax, (seed, frame, gw_fraction) in zip(axes_list, seed_frames):
+    for ax, (seed, frame, gw_fraction, gw_guarantee_fraction) in zip(axes_list, seed_frames):
         ax.plot(frame["round"], frame["expected_cut_fraction"], label="expected", linewidth=1.2)
         ax.plot(frame["round"], frame["direct_cut_fraction"], label="C_d", linewidth=1.1)
         ax.plot(frame["round"], frame["direct_greedy_cut_fraction"], label="C_dg", linewidth=1.1)
         ax.plot(frame["round"], frame["sample_cut_fraction"], label="C_s", linewidth=1.0)
         ax.axhline(gw_fraction, color="black", linestyle="--", linewidth=1.3, label="GW expected")
+        ax.axhline(
+            gw_guarantee_fraction,
+            color="#6b7280",
+            linestyle=":",
+            linewidth=1.2,
+            label="GW guarantee",
+        )
         ax.set_title(f"seed={seed}")
         ax.grid(alpha=0.2)
     for ax in axes_list[len(seed_frames) :]:
@@ -224,16 +282,16 @@ def plot_small_multiples(output_dir: Path, seed_frames: list[tuple[int, pd.DataF
     plt.close(fig)
 
 
-def run_seed(args: argparse.Namespace, seed: int) -> tuple[dict, pd.DataFrame, float]:
+def run_seed(args: argparse.Namespace, seed: int) -> tuple[dict, pd.DataFrame, float, float]:
     output_dir = Path(args.output_dir) / f"seed_{seed}"
     output_dir.mkdir(parents=True, exist_ok=True)
     edges = make_edges(int(args.n), int(args.degree), int(seed))
     total_weight = float(len(edges))
 
-    gw_expected = load_or_run_gw_expected(args, edges, output_dir, int(seed))
+    gw_expected, gw_guarantee_cut, gw_guarantee_fraction = load_or_run_gw_expected(args, edges, output_dir, int(seed))
     trace, config = sqnn_trace_for_seed(args, int(seed), output_dir, total_weight)
-    plot_seed_trace(trace, gw_expected.cut_fraction, output_dir, int(seed))
-    plot_seed_energy(trace, gw_expected.cut_value, output_dir, int(seed))
+    plot_seed_trace(trace, gw_expected.cut_fraction, gw_guarantee_fraction, output_dir, int(seed))
+    plot_seed_energy(trace, gw_expected.cut_value, gw_guarantee_cut, output_dir, int(seed))
 
     best_expected = best_row(trace, "expected_cut")
     best_direct = best_row(trace, "direct_cut")
@@ -246,6 +304,8 @@ def run_seed(args: argparse.Namespace, seed: int) -> tuple[dict, pd.DataFrame, f
         "W": total_weight,
         "gw_expected_C": float(gw_expected.cut_value),
         "gw_expected_C_over_W": float(gw_expected.cut_fraction),
+        "gw_guarantee_C": float(gw_guarantee_cut),
+        "gw_guarantee_C_over_W": float(gw_guarantee_fraction),
         "sqnn_expected_C": best_expected["cut"],
         "sqnn_expected_C_over_W": best_expected["cut_fraction"],
         "sqnn_expected_round": best_expected["round"],
@@ -271,26 +331,28 @@ def run_seed(args: argparse.Namespace, seed: int) -> tuple[dict, pd.DataFrame, f
         "z_message_gain_final": config.get("z_message_gain_final", ""),
     }
     write_json(output_dir / "summary.json", summary)
-    return summary, trace, float(gw_expected.cut_fraction)
+    return summary, trace, float(gw_expected.cut_fraction), float(gw_guarantee_fraction)
 
 
 def write_report(summary: pd.DataFrame, output_dir: Path) -> None:
     lines = [
         "# n=512 Ten Random Graphs: SQNN vs GW Expected",
         "",
-        "Classical baseline: GW expected hyperplane value only.",
-        "No sampled-best or local-search postprocessed GW line is used as a baseline in this report.",
+        "Main classical baseline: GW expected hyperplane value.",
+        "Reference lower bound: GW guarantee = alpha_GW times the relaxed vector cut.",
+        "GW sampled-best and GW+greedy are not used as baselines in this report.",
         "All values are cut fractions C/W; no C* approximation ratio is claimed here.",
         f"Model config: `{summary['model_config'].iloc[0]}`.",
         f"SQNN head_count={int(summary['head_count'].iloc[0])}, "
         f"head_seed_stride={int(summary['head_seed_stride'].iloc[0])}.",
         "",
-        "| seed | GW expected | SQNN expected | C_d | C_dg | C_s | sample K | heads |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| seed | GW expected | GW guarantee | SQNN expected | C_d | C_dg | C_s | sample K | heads |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in summary.to_dict("records"):
         lines.append(
             f"| {int(row['seed'])} | {row['gw_expected_C_over_W']:.6f} | "
+            f"{row['gw_guarantee_C_over_W']:.6f} | "
             f"{row['sqnn_expected_C_over_W']:.6f} | {row['sqnn_direct_C_over_W']:.6f} | "
             f"{row['sqnn_direct_greedy_C_over_W']:.6f} | {row['sqnn_sample_C_over_W']:.6f} | "
             f"{int(row['sqnn_sample_count'])} | {int(row['head_count'])} |"
@@ -298,6 +360,7 @@ def write_report(summary: pd.DataFrame, output_dir: Path) -> None:
     means = summary[
         [
             "gw_expected_C_over_W",
+            "gw_guarantee_C_over_W",
             "sqnn_expected_C_over_W",
             "sqnn_direct_C_over_W",
             "sqnn_direct_greedy_C_over_W",
@@ -311,6 +374,7 @@ def write_report(summary: pd.DataFrame, output_dir: Path) -> None:
             "",
             "```text",
             f"GW expected       {means['gw_expected_C_over_W']:.6f}",
+            f"GW guarantee      {means['gw_guarantee_C_over_W']:.6f}",
             f"SQNN expected    {means['sqnn_expected_C_over_W']:.6f}",
             f"SQNN C_d         {means['sqnn_direct_C_over_W']:.6f}",
             f"SQNN C_dg        {means['sqnn_direct_greedy_C_over_W']:.6f}",
@@ -359,9 +423,9 @@ def main() -> None:
     summaries = []
     seed_frames = []
     for seed in args.seeds:
-        summary, trace, gw_fraction = run_seed(args, int(seed))
+        summary, trace, gw_fraction, gw_guarantee_fraction = run_seed(args, int(seed))
         summaries.append(summary)
-        seed_frames.append((int(seed), trace, gw_fraction))
+        seed_frames.append((int(seed), trace, gw_fraction, gw_guarantee_fraction))
     summary_frame = pd.DataFrame(summaries).sort_values("seed")
     summary_frame.to_csv(args.output_dir / "summary.csv", index=False)
     write_report(summary_frame, args.output_dir)

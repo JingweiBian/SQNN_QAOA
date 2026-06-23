@@ -39,7 +39,7 @@ from quantum.warmstart import (  # noqa: E402
 )
 from quantum.warmstart.losses import bernoulli_entropy  # noqa: E402
 from quantum.warmstart.qubo import QUBOProblem  # noqa: E402
-from quantum.warmstart.qubo_sqnn import bloch_to_probabilities, probabilities_to_bloch  # noqa: E402
+from quantum.warmstart.qubo_sqnn import bloch_to_probabilities  # noqa: E402
 
 
 SUMMARY_FIELDS = [
@@ -133,6 +133,12 @@ def make_train_args(config):
 
 
 def objective_ratio(benchmark, assignment, best_known):
+    """Return the score used by historical ``*_ratio`` fields.
+
+    中文提醒：这个函数名叫 ratio，但分母完全由 ``best_known`` 决定。
+    当前 MaxCut-3 主线传入的通常是总边权 ``W``，所以返回的是 ``C/W``；
+    如果以后传入精确最优 ``C*``，同一行代码才会变成严格近似比 ``C/C*``。
+    """
     # ``best_known`` controls the denominator. In current MaxCut-3 runs this
     # is usually total edge weight W, so returned values are cut fractions C/W.
     # Passing an exact optimum C* or a classical best-known cut changes the
@@ -347,7 +353,7 @@ class JRegularizedSyncLocalSQNN(nn.Module):
         bloch = torch.zeros((problem.num_variables, 3), dtype=self.dtype, device=self.device)
         if self.initial_probabilities.numel() == problem.num_variables:
             initial = self.initial_probabilities.to(device=self.device, dtype=self.dtype).clamp(1e-6, 1.0 - 1e-6)
-            z_value = probabilities_to_bloch(initial)
+            z_value = 2.0 * initial - 1.0
             bloch[:, 0] = torch.sqrt((1.0 - z_value * z_value).clamp_min(0.0))
             bloch[:, 2] = z_value
         else:
@@ -680,6 +686,16 @@ def j_stats(values):
 
 
 def trace_rows(config, state, benchmark, best_known):
+    """Convert a model trajectory into one row per SQNN round.
+
+    每一行对应一个 message round，方便检查：
+    - expected_energy / expected_ratio: 概率分布本身的期望质量；
+    - rounded_energy / rounded_ratio: 直接 p>=0.5 读出的二值解质量；
+    - confidence/std: 概率是否已经明显远离 0.5；
+    - j_*: 本轮更新是否违背局部场下降方向。
+
+    再强调一次：当 ``best_known=W`` 时，所有 ``*_ratio`` 都是 ``C/W``。
+    """
     problem = benchmark.problem
     known = best_known.to(device=problem.linear.device, dtype=problem.linear.dtype)
     rows = []
@@ -714,6 +730,19 @@ def trace_rows(config, state, benchmark, best_known):
 
 
 def evaluate_solution_quality(config, state, benchmark, best_known, generator):
+    """Evaluate one trained SQNN state with the project-standard readouts.
+
+    这里不是训练 loss，而是实验报告指标：
+    1. 找 expected_ratio 最好的那一轮；
+    2. 对该轮概率做 direct rounding；
+    3. 对 direct rounding 结果做 1-bit greedy local search；
+    4. 从该轮概率采样，再做 batch greedy local search；
+    5. 统计 confidence fixing 后 residual 规模。
+
+    当前 MaxCut-3 中 ``best_known`` 默认仍是 ``W``，所以返回字典里的
+    ``best_expected_ratio``、``best_round_local_search_ratio`` 等字段名沿用
+    历史命名，但数学含义是 cut fraction ``C/W``。
+    """
     problem = benchmark.problem
     known = best_known.to(device=problem.linear.device, dtype=problem.linear.dtype)
     rows = trace_rows(config, state, benchmark, known)

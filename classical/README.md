@@ -12,28 +12,21 @@ generally equal to `W`. A value should be called an approximation ratio only
 when the exact optimum is known or when the denominator is explicitly named
 as a best-known/upper-bound reference.
 
-`maxcut3_compare.py` is a comparison driver.  It keeps the classical baselines
-in this folder, but imports the SQNN model itself from `quantum.warmstart`.
-It does four things:
+`maxcut3_compare.py` does three things:
 
 1. Generates the same random 3-regular MaxCut instances used by the SQNN code.
 2. Solves a CP-SAT MaxCut model to obtain an exact optimum when possible.
-3. Runs two practical GW-style reference values:
+3. Runs three practical GW-style reference values:
    `GW-style expected` is the paper-aligned baseline
    `sum_edges arccos(v_i dot v_j) / pi`; `GW-style sampled-best` is the best
-   cut among sampled hyperplanes.
-4. Optionally trains/reloads the current SQNN route and compares its readouts
-   against those classical references.
-
-Do not define quantum/SQNN model classes in this folder.  Reusable quantum
-models belong under `quantum/`; this folder should contain classical baselines,
-metrics, plotting, and comparison entry points only.
+   cut among sampled hyperplanes; `GW-style + 1-bit greedy` additionally
+   applies local search.
 
 The GW implementation here is called `GW-style` because it uses a low-rank
 Burer-Monteiro relaxation rather than a full certified SDP solve. The expected
 hyperplane value is the closer analogue of the grey GW line in Augustino et al.
-Figure 4. The sampled-best value is a sampling reference, but it is not the
-paper-aligned GW expected baseline.
+Figure 4. The sampled-best and `+ 1-bit greedy` values are stronger heuristic
+references, but they are not the paper-aligned GW baseline.
 
 SQNN round-trace columns use the following readout names:
 
@@ -135,12 +128,12 @@ Best complete ten-seed candidate:
 
 ```text
 edge_boost_mem060_no_xy
-short local-field memory
-random RZ+RY symmetry breaking
-directed z-edge anti-correlation message
-late collapse into RY
-stronger z-edge gain schedule
-full-time XY feedback removed
+phase_mode            = memory_z_edge_cavity_collapse
+phase_memory_decay    = 0.60
+xy_feedback_init      = 0.0
+collapse_init         = 0.06
+z_message_gain        = 1.8
+z_message_gain_final  = 2.6
 ```
 
 Against GW expected on seeds `0..9`:

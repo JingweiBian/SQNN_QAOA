@@ -8,9 +8,9 @@ This script is intentionally self-contained enough for inspection:
 2. It solves MaxCut as a CP-SAT binary optimization model:
        y_ij = 1 iff x_i != x_j, maximize sum y_ij.
 3. It runs a practical Goemans-Williamson-style baseline:
-       optimize low-rank unit vectors, then report GW expected and sampled-best
-       hyperplane cuts without local-search postprocessing.
-4. It trains or reloads the current Clean-ZEdge / V14 SQNN configuration and plots
+       optimize low-rank unit vectors, round by random hyperplanes,
+       then optionally apply 1-bit greedy local search.
+4. It trains or reloads the current V14 SQNN best configuration and plots
        expected, direct rounding, and direct+greedy scores by SQNN round.
 
 Metric naming:
@@ -50,8 +50,13 @@ from ortools.sat.python import cp_model
 
 from explore_j_regularized_sqnn import config_id, make_train_args
 from quantum.warmstart import batch_greedy_local_search, greedy_local_search, sample_bernoulli
-from quantum.warmstart.phase_aware_sqnn import MultiHeadPhaseAwareSQNN, PhaseAwareJRegularizedSQNN
-from run_maxcut3_phase_aware_probe import load_base_config, train_phase_one, with_updates
+from run_maxcut3_phase_aware_probe import (
+    MultiHeadPhaseAwareSQNN,
+    PhaseAwareJRegularizedSQNN,
+    load_base_config,
+    train_phase_one,
+    with_updates,
+)
 from run_qubo_warmstart import make_benchmark
 
 
@@ -200,10 +205,11 @@ def gw_style_baselines(
     lr: float,
     restarts: int,
     rounding_samples: int,
+    greedy_passes: int,
     seed: int,
     device: str,
-) -> tuple[BaselineResult, BaselineResult]:
-    """Run GW-style expected rounding plus sampled-best helper baseline."""
+) -> tuple[BaselineResult, BaselineResult, BaselineResult]:
+    """Run GW-style expected rounding plus sampled/greedy helper baselines."""
     start = time.perf_counter()
     edge_index = torch.tensor(edges, dtype=torch.long, device=device).t().contiguous()
     total_weight = max(float(len(edges)), 1.0)
@@ -264,6 +270,10 @@ def gw_style_baselines(
             best_assignment = assignments[index].detach().cpu().numpy().astype(np.int8)
         processed += count
 
+    if best_assignment is None:
+        raise RuntimeError("GW-style rounding did not produce assignments")
+    greedy_assignment = greedy_assignment_from_numpy(edges, best_assignment, greedy_passes)
+    greedy_cut = cut_value_from_edges(edges, greedy_assignment)
     elapsed = time.perf_counter() - start
     expected = BaselineResult(
         name="gw_style_low_rank_hyperplane_expected",
@@ -277,6 +287,7 @@ def gw_style_baselines(
             "restarts": int(restarts),
             "rounding_samples": int(rounding_samples),
             "sampled_best_cut": int(best_cut),
+            "post_greedy_cut": int(greedy_cut),
             "relaxed_cut": float(best_relaxed),
             "relaxed_cut_fraction": float(best_relaxed) / total_weight,
             "definition": "sum_edges arccos(v_i dot v_j) / pi",
@@ -294,20 +305,59 @@ def gw_style_baselines(
             "restarts": int(restarts),
             "rounding_samples": int(rounding_samples),
             "expected_cut": float(expected_cut),
+            "post_greedy_cut": int(greedy_cut),
             "relaxed_cut": float(best_relaxed),
             "relaxed_cut_fraction": float(best_relaxed) / total_weight,
         },
     )
-    return expected, sampled_best
+    plus_greedy = BaselineResult(
+        name="gw_style_low_rank_hyperplane_plus_1bit_greedy",
+        cut_value=float(greedy_cut),
+        cut_fraction=float(greedy_cut) / total_weight,
+        seconds=float(elapsed),
+        details={
+            "rank": int(rank),
+            "steps": int(steps),
+            "lr": float(lr),
+            "restarts": int(restarts),
+            "rounding_samples": int(rounding_samples),
+            "pre_greedy_cut": int(best_cut),
+            "expected_cut": float(expected_cut),
+            "relaxed_cut": float(best_relaxed),
+            "relaxed_cut_fraction": float(best_relaxed) / total_weight,
+        },
+    )
+    return expected, sampled_best, plus_greedy
 
 
-def load_gw_style_results(path: Path, total_weight: float) -> tuple[BaselineResult, BaselineResult]:
+def load_gw_style_results(path: Path, total_weight: float) -> tuple[BaselineResult, BaselineResult, BaselineResult]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if "expected" in payload and "sampled_best" in payload:
+    if "expected" in payload and "sampled_best" in payload and "plus_greedy" in payload:
         return (
             BaselineResult(**payload["expected"]),
             BaselineResult(**payload["sampled_best"]),
+            BaselineResult(**payload["plus_greedy"]),
         )
+    if "raw" in payload and "plus_greedy" in payload:
+        raise ValueError("old GW cache lacks expected hyperplane cut; recompute required")
+
+    # Backward compatibility for older files where the main result was GW+greedy
+    # and the raw rounding cut was stored only in details.pre_greedy_cut.
+    # This cannot reconstruct expected GW, so callers should recompute.
+    plus_greedy = BaselineResult(**payload)
+    details = dict(plus_greedy.details)
+    raw_cut = float(details.get("pre_greedy_cut", plus_greedy.cut_value))
+    sampled_best = BaselineResult(
+        name="gw_style_low_rank_hyperplane_sampled_best",
+        cut_value=raw_cut,
+        cut_fraction=raw_cut / max(float(total_weight), 1e-12),
+        seconds=plus_greedy.seconds,
+        details={
+            **details,
+            "post_greedy_cut": int(plus_greedy.cut_value),
+        },
+    )
+    plus_greedy.name = "gw_style_low_rank_hyperplane_plus_1bit_greedy"
     raise ValueError("old GW cache lacks expected hyperplane cut; recompute required")
 
 
@@ -315,12 +365,14 @@ def write_gw_style_results(
     path: Path,
     expected: BaselineResult,
     sampled_best: BaselineResult,
+    plus_greedy: BaselineResult,
 ) -> None:
     write_json(
         path,
         {
             "expected": asdict(expected),
             "sampled_best": asdict(sampled_best),
+            "plus_greedy": asdict(plus_greedy),
         },
     )
 
@@ -354,7 +406,6 @@ def best_v14_gain14_config(
         sample_local_search_passes=80,
         log_every=10,
         warm_start_source="none",
-        symmetry_breaking="random_rz_ry",
         phase_mode="memory_xy_feedback_z_edge_cavity_collapse",
         phase_memory_decay=0.80,
         xy_feedback_init=0.05,
@@ -497,6 +548,7 @@ def sqnn_round_trace(
     exact: ExactResult,
     gw_expected: BaselineResult,
     gw_sampled_best: BaselineResult,
+    gw_plus_greedy: BaselineResult,
     *,
     device: str,
     greedy_passes: int,
@@ -511,7 +563,7 @@ def sqnn_round_trace(
 
     denominator_exact = exact.cut_value if exact.is_exact else math.nan
     denominator_upper = exact.upper_bound if math.isfinite(exact.upper_bound) and exact.upper_bound > 0 else math.nan
-    denominator_best = max(exact.cut_value, gw_sampled_best.cut_value)
+    denominator_best = max(exact.cut_value, gw_sampled_best.cut_value, gw_plus_greedy.cut_value)
     sample_gen = torch.Generator(device=torch_device)
     sample_gen.manual_seed(int(config.get("seed", 0)) + 910003)
     rows = []
@@ -564,6 +616,7 @@ def plot_trace(
     exact: ExactResult,
     gw_expected: BaselineResult,
     gw_sampled_best: BaselineResult,
+    gw_plus_greedy: BaselineResult,
     output_path: Path,
 ) -> None:
     """Plot SQNN round quality against GW and optimum/bounds."""
@@ -650,6 +703,7 @@ def plot_metric_files(
     exact: ExactResult,
     gw_expected: BaselineResult,
     gw_sampled_best: BaselineResult,
+    gw_plus_greedy: BaselineResult,
     output_dir: Path,
 ) -> dict[str, str]:
     """Write separate inspection plots for cut fraction, ratio, and energy."""
@@ -742,9 +796,9 @@ def run_one(args, n: int) -> dict:
     gw_path = output_dir / "gw_style.json"
     if gw_path.exists() and not args.force:
         try:
-            gw_expected, gw_sampled_best = load_gw_style_results(gw_path, total_weight)
+            gw_expected, gw_sampled_best, gw_plus_greedy = load_gw_style_results(gw_path, total_weight)
         except ValueError:
-            gw_expected, gw_sampled_best = gw_style_baselines(
+            gw_expected, gw_sampled_best, gw_plus_greedy = gw_style_baselines(
                 edges,
                 n,
                 rank=int(args.gw_rank),
@@ -752,11 +806,12 @@ def run_one(args, n: int) -> dict:
                 lr=float(args.gw_lr),
                 restarts=int(args.gw_restarts),
                 rounding_samples=int(args.gw_rounding_samples),
+                greedy_passes=int(args.greedy_passes),
                 seed=seed,
                 device=args.device,
             )
     else:
-        gw_expected, gw_sampled_best = gw_style_baselines(
+        gw_expected, gw_sampled_best, gw_plus_greedy = gw_style_baselines(
             edges,
             n,
             rank=int(args.gw_rank),
@@ -764,19 +819,15 @@ def run_one(args, n: int) -> dict:
             lr=float(args.gw_lr),
             restarts=int(args.gw_restarts),
             rounding_samples=int(args.gw_rounding_samples),
+            greedy_passes=int(args.greedy_passes),
             seed=seed,
             device=args.device,
         )
-    write_gw_style_results(gw_path, gw_expected, gw_sampled_best)
+    write_gw_style_results(gw_path, gw_expected, gw_sampled_best, gw_plus_greedy)
 
     rounds = int(args.rounds_1024 if int(n) >= 1024 else args.rounds)
     epochs = int(args.epochs_1024 if int(n) >= 1024 else args.epochs)
-    config_builder = (
-        recommended_clean_edgeboost_config
-        if args.model_config == "clean_edgeboost_mem060"
-        else best_v14_gain14_config
-    )
-    config = config_builder(
+    config = best_v14_gain14_config(
         n=n,
         seed=seed,
         rounds=rounds,
@@ -791,6 +842,7 @@ def run_one(args, n: int) -> dict:
         exact,
         gw_expected,
         gw_sampled_best,
+        gw_plus_greedy,
         device=args.device,
         greedy_passes=int(args.greedy_passes),
         sample_count=int(args.sqnn_sample_count),
@@ -798,8 +850,8 @@ def run_one(args, n: int) -> dict:
     trace_path = output_dir / "sqnn_round_trace.csv"
     trace.to_csv(trace_path, index=False)
     plot_path = output_dir / "sqnn_vs_gw_round_trace.png"
-    plot_trace(trace, exact, gw_expected, gw_sampled_best, plot_path)
-    metric_plots = plot_metric_files(trace, exact, gw_expected, gw_sampled_best, output_dir)
+    plot_trace(trace, exact, gw_expected, gw_sampled_best, gw_plus_greedy, plot_path)
+    metric_plots = plot_metric_files(trace, exact, gw_expected, gw_sampled_best, gw_plus_greedy, output_dir)
 
     best_expected_row = trace.loc[trace["expected_cut"].idxmax()].to_dict()
     best_direct_row = trace.loc[trace["direct_cut"].idxmax()].to_dict()
@@ -808,6 +860,7 @@ def run_one(args, n: int) -> dict:
     best_known_cut = max(
         float(exact.cut_value),
         float(gw_sampled_best.cut_value),
+        float(gw_plus_greedy.cut_value),
         float(best_row["direct_greedy_cut"]),
         float(best_sample_row["sample_cut"]),
     )
@@ -819,8 +872,7 @@ def run_one(args, n: int) -> dict:
         "exact_or_cp_sat": asdict(exact),
         "gw_style_expected": asdict(gw_expected),
         "gw_style_sampled_best": asdict(gw_sampled_best),
-        "sqnn_model_config": str(args.model_config),
-        "sqnn_phase": config.get("phase", ""),
+        "gw_style_plus_greedy": asdict(gw_plus_greedy),
         "sqnn_best_expected": best_expected_row,
         "sqnn_best_direct": best_direct_row,
         "sqnn_best_direct_greedy": best_row,
@@ -832,6 +884,9 @@ def run_one(args, n: int) -> dict:
         "gw_expected_strict_approx_ratio": gw_expected.cut_value / exact.cut_value if exact.is_exact else "",
         "gw_sampled_best_strict_approx_ratio": (
             gw_sampled_best.cut_value / exact.cut_value if exact.is_exact else ""
+        ),
+        "gw_plus_greedy_strict_approx_ratio": (
+            gw_plus_greedy.cut_value / exact.cut_value if exact.is_exact else ""
         ),
         "sqnn_strict_approx_ratio": (
             float(best_row["direct_greedy_cut"]) / exact.cut_value if exact.is_exact else ""
@@ -847,6 +902,7 @@ def run_one(args, n: int) -> dict:
         ),
         "gw_expected_cut_fraction": gw_expected.cut_fraction,
         "gw_sampled_best_cut_fraction": gw_sampled_best.cut_fraction,
+        "gw_plus_greedy_cut_fraction": gw_plus_greedy.cut_fraction,
         "sqnn_expected_cut_fraction": float(best_expected_row["expected_cut_fraction"]),
         "sqnn_direct_cut_fraction": float(best_direct_row["direct_cut_fraction"]),
         "sqnn_cut_fraction": float(best_row["direct_greedy_cut_fraction"]),
@@ -858,6 +914,11 @@ def run_one(args, n: int) -> dict:
         ),
         "gw_sampled_best_ratio_to_upper_bound": (
             gw_sampled_best.cut_value / exact.upper_bound
+            if math.isfinite(exact.upper_bound) and exact.upper_bound > 0
+            else ""
+        ),
+        "gw_plus_greedy_ratio_to_upper_bound": (
+            gw_plus_greedy.cut_value / exact.upper_bound
             if math.isfinite(exact.upper_bound) and exact.upper_bound > 0
             else ""
         ),
@@ -883,6 +944,7 @@ def write_overall_report(summaries: list[dict], output_dir: Path) -> None:
         exact = item["exact_or_cp_sat"]
         gw_expected = item.get("gw_style_expected", {})
         gw_sampled_best = item.get("gw_style_sampled_best", item.get("gw_style_raw", item.get("gw_style", {})))
+        gw_plus_greedy = item.get("gw_style_plus_greedy", item.get("gw_style", {}))
         if not gw_expected:
             gw_expected = gw_sampled_best
         rows.append(
@@ -893,7 +955,7 @@ def write_overall_report(summaries: list[dict], output_dir: Path) -> None:
                 "C_star_or_incumbent": exact["cut_value"],
                 "best_known_cut": item.get(
                     "best_known_cut",
-                    max(exact["cut_value"], gw_sampled_best["cut_value"]),
+                    max(exact["cut_value"], gw_sampled_best["cut_value"], gw_plus_greedy["cut_value"]),
                 ),
                 "cp_sat_upper_bound": exact["upper_bound"],
                 "cp_sat_gap": exact["relative_gap"],
@@ -906,6 +968,12 @@ def write_overall_report(summaries: list[dict], output_dir: Path) -> None:
                     gw_sampled_best["cut_fraction"],
                 ),
                 "gw_sampled_best_C_over_Cstar": item.get("gw_sampled_best_strict_approx_ratio", ""),
+                "gw_plus_greedy_C": gw_plus_greedy["cut_value"],
+                "gw_plus_greedy_C_over_W": item.get(
+                    "gw_plus_greedy_cut_fraction",
+                    gw_plus_greedy["cut_fraction"],
+                ),
+                "gw_plus_greedy_C_over_Cstar": item.get("gw_plus_greedy_strict_approx_ratio", ""),
                 "sqnn_expected_C": item.get("sqnn_best_expected", {}).get("expected_cut", ""),
                 "sqnn_expected_C_over_W": item.get("sqnn_expected_cut_fraction", ""),
                 "sqnn_expected_C_over_Cstar": item.get("sqnn_expected_strict_approx_ratio", ""),
@@ -967,11 +1035,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=110)
     parser.add_argument("--rounds-1024", type=int, default=380)
     parser.add_argument("--epochs-1024", type=int, default=130)
-    parser.add_argument(
-        "--model-config",
-        choices=["clean_edgeboost_mem060", "v14_memory_xy_z_edge_gain14"],
-        default="clean_edgeboost_mem060",
-    )
     parser.add_argument("--head-count", type=int, default=1)
     parser.add_argument("--head-seed-stride", type=int, default=7919)
     return parser.parse_args()

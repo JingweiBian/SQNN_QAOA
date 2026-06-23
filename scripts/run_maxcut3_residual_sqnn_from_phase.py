@@ -22,7 +22,7 @@ from explore_j_regularized_sqnn import j_penalty_value, load_summary, make_train
 from quantum.warmstart import greedy_local_search, sample_bernoulli  # noqa: E402
 from quantum.warmstart.losses import bernoulli_entropy  # noqa: E402
 from rescore_maxcut3_phase_readout import build_phase_model  # noqa: E402
-from quantum.warmstart.phase_aware_sqnn import PhaseAwareJRegularizedSQNN  # noqa: E402
+from run_maxcut3_phase_aware_probe import PhaseAwareJRegularizedSQNN  # noqa: E402
 from run_qubo_warmstart import make_benchmark, ratio_value  # noqa: E402
 
 

@@ -7,4 +7,3 @@ matplotlib
 networkx
 tqdm
 pandas
-ortools

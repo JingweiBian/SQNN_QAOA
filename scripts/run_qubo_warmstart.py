@@ -89,13 +89,6 @@ def build_model(args, problem):
         return QUBOSynchronousLocalFieldSQNN(
             num_variables=problem.num_variables,
             message_rounds=args.message_rounds,
-            symmetry_breaking=getattr(args, "symmetry_breaking", "none"),
-            symmetry_strength=float(getattr(args, "symmetry_strength", 0.0)),
-            symmetry_seed=(
-                int(getattr(args, "symmetry_seed", -1))
-                if int(getattr(args, "symmetry_seed", -1)) >= 0
-                else int(args.seed)
-            ),
         )
     if args.model == "sync_local_xpos":
         return QUBOPositiveXSynchronousLocalFieldSQNN(
@@ -551,9 +544,6 @@ def main():
     parser.add_argument("--entropy-weight", type=float, default=0.02)
     parser.add_argument("--final-entropy-weight", type=float, default=0.001)
     parser.add_argument("--grad-clip", type=float, default=5.0)
-    parser.add_argument("--symmetry-breaking", default="none")
-    parser.add_argument("--symmetry-strength", type=float, default=0.0)
-    parser.add_argument("--symmetry-seed", type=int, default=-1)
     parser.add_argument("--num-samples", type=int, default=512)
     parser.add_argument("--local-search-passes", type=int, default=200)
     parser.add_argument("--random-samples", type=int, default=512)

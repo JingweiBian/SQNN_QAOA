@@ -73,10 +73,6 @@ from .qubo_sqnn import (
     bloch_to_probabilities,
     probabilities_to_bloch,
 )
-from .phase_aware_sqnn import (
-    MultiHeadPhaseAwareSQNN,
-    PhaseAwareJRegularizedSQNN,
-)
 from .sampling import (
     best_sample_from_probabilities,
     sample_bernoulli,
@@ -89,9 +85,7 @@ __all__ = [
     "QUANTUM_NODE_FEATURE_DIM",
     "EdgeConditionedRotation",
     "MaxCutBenchmark",
-    "MultiHeadPhaseAwareSQNN",
     "PlantedParityQUBOBenchmark",
-    "PhaseAwareJRegularizedSQNN",
     "QUBOHybridWarmStartSQNN",
     "QUBOInstanceEmbeddingWarmStartSQNN",
     "QUBOMeanFieldWarmStart",

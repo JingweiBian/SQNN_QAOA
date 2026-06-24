@@ -1163,8 +1163,14 @@ Near-term optimization routes:
 2. Bad-edge cluster coherent anneal
    Move from independent node perturbations to cluster-level coherent rotations.
    The active cluster should be built from connected bad-edge components or
-   high-conflict neighborhoods, so the escape can cross a basin boundary by
-   changing several coupled bits together.
+   high-conflict neighborhoods.  A "bad edge" means an edge whose two endpoint
+   bits currently sit on the same side of the cut.  The cluster is therefore a
+   local frustrated subgraph, not a list of isolated single-bit mistakes.
+
+   The escape operation should anneal or rotate the whole conflicted component
+   coherently, so several coupled bits can cross a basin boundary together.
+   This is closer to a Bloch/quantum-style cluster anneal than to flipping one
+   node at a time.
 
 3. Gain-guided Bloch field
    Inject MaxCut one-flip gain into the continuous Bloch dynamics instead of
@@ -1172,15 +1178,21 @@ Near-term optimization routes:
    stronger push toward flipping, cheap negative-gain nodes should be allowed
    to cross barriers, and large negative-gain nodes should be protected.
 
-4. Short non-monotone recovery window
+4. Short non-monotone recovery window  [required for next V14 escape]
    During escape, temporarily relax monotone accept for a small number of
-   rounds.  The model should be allowed to get worse briefly after the basin
-   jump, then return to monotone accept after recovery.
+   rounds, typically 8 to 16 rounds.  The model should be allowed to get worse
+   briefly after the basin jump, then return to monotone accept after recovery.
+
+   This is required because immediate monotone rollback can erase a useful
+   basin jump before the V14 dynamics has enough rounds to reorganize the
+   Bloch state.
 
 5. Train-time anneal injection
-   Do not only attach escape after a trained V14 trajectory.  Randomly inject
-   soft-global anneal events during training so V14 learns how to recover from
-   perturbed Bloch states and continue lowering energy.
+   This should not mean wasting compute by jumping from the beginning.
+   Preferred use: inject rare, late, plateau-triggered perturbations during
+   training, or train on states sampled from real plateau regions.  The goal is
+   to teach V14 how to recover after an escape event, not to disturb every
+   normal descent trajectory.
 ```
 
 Preferred next experiment:
@@ -1202,4 +1214,83 @@ n = 512, degree = 3, seed = 0, push best C_dg from 702 toward 705.
 Secondary target:
 test the best mechanism on multiple 512-node random 3-regular graph seeds to
 verify that the gain is not a single-graph artifact.
+```
+
+---
+
+## 15. Bad-Edge Cluster Bloch Anneal + Non-Monotone Recovery
+
+Detailed report:
+
+```text
+docs/reports/v14_cluster_bloch_anneal_probe.md
+```
+
+Main script:
+
+```text
+scripts/run_v14_cluster_bloch_anneal_search.py
+```
+
+Implemented mechanism:
+
+```text
+1. trigger near plateau;
+2. build bad-edge clusters from uncut MaxCut edges;
+3. cap giant clusters so a single escape does not perturb half the graph;
+4. apply an alternating cluster RY field in Bloch space;
+5. allow an 8 or 16 round non-monotone recovery window;
+6. return to ordinary monotone accept after recovery.
+```
+
+n=512, degree=3, seed=0 results:
+
+```text
+base V14                 C_dg = 694, C_d = 688, C_exp = 671.374
+known random RY          C_dg = 697, C_d = 692, C_exp = 682.140
+previous soft global     C_dg = 702, C_d = 701, C_exp = 687.945
+
+cluster direct-basis     C_dg = 701, C_d = 699, C_exp = 683.267
+cluster greedy-basis     C_dg = 702, C_d = 696, C_exp = 680.815
+greedy-basis replay      C_dg = 702, C_d = 688, C_exp = 587.727
+```
+
+Time record:
+
+```text
+Typical cluster case time: 1.1s to 1.3s on CPU.
+Fastest C_dg >= 700: 0.694s.
+Fastest C_dg >= 702: 0.809s.
+C_dg >= 705: not reached in the current scans.
+```
+
+Current judgement:
+
+```text
+The non-monotone recovery window is confirmed useful and should stay.
+It prevents immediate monotone rollback after a basin jump.
+
+Bad-edge cluster Bloch anneal is fast and can recover 701 to 702-level C_dg,
+but it does not yet beat the previous soft-global best and does not reach 705.
+
+Direct-basis clusters preserve the probability-energy state better.
+Greedy-basis clusters can hit 702 faster, but they can damage expected cut
+badly, so this is not yet a clean SQNN probability-state improvement.
+
+Decision:
+keep the non-monotone recovery window as a core escape component.
+Do not treat the current bad-edge cluster Bloch anneal as the main replacement
+for soft-global anneal yet.  Its current advantage is helping direct+greedy find
+a better basin, while the probability-state quality can degrade, especially
+with greedy-basis cluster construction.
+```
+
+Next refinement:
+
+```text
+1. use expected-edge conflict rather than hard direct bad edges;
+2. make recovery bounded instead of unconditional accept-all;
+3. adapt cluster strength after several recovery rounds;
+4. rollback to the best recovery-window state if expected/direct quality does
+   not recover after the jump.
 ```

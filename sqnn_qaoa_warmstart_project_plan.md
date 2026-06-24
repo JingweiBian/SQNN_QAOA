@@ -9137,3 +9137,308 @@ Next directions:
 4. If SQNN expected must beat GW too, add a training objective aimed at
    improving the probability distribution, not only final bitstring readout.
 ```
+
+### 18.38 V15 pair-aware SQNN: edge pair belief, pair-guided readout, and relation collapse
+
+V15 was introduced to test whether V14's node-product approximation is losing
+important two-variable information.  V14 keeps one Bloch vector per variable and
+uses product marginals \(p_i p_j\) in the relaxed QUBO energy.  V15 keeps the
+same node-level Bloch dynamics, but adds one trainable edge state per QUBO edge:
+
+```text
+node state: one Bloch vector per variable
+edge state: raw_corr_ij for every QUBO edge
+corr_ij = tanh(raw_corr_ij)
+```
+
+For current node marginals \(p_i,p_j\), V15 interprets `corr_ij` inside the
+valid Frechet interval of the pair probability:
+
+\[
+q_{ij}=P(x_i=1,x_j=1).
+\]
+
+The parametrization is:
+
+```text
+corr = 0   -> q_ij = p_i p_j
+corr = 1   -> q_ij = min(p_i, p_j)
+corr = -1  -> q_ij = max(0, p_i + p_j - 1)
+```
+
+Thus V15 can represent a pair belief table:
+
+\[
+B_{ij}(x_i,x_j)
+=
+\begin{bmatrix}
+P(0,0) & P(0,1)\\
+P(1,0) & P(1,1)
+\end{bmatrix}
+\]
+
+while still keeping the global state compact.  This is not a full many-body
+state; it is a pair-marginal relaxation.
+
+#### 18.38.1 V15 energy and training path
+
+V15 adds a pair-relaxed energy:
+
+\[
+E_{\text{pair}}
+=
+\sum_i Q_i p_i
++
+\sum_{(i,j)} Q_{ij} q_{ij}
++
+\text{constant}.
+\]
+
+The training/acceptance objective is a blend:
+
+```text
+loss_energy = (1 - pair_energy_weight) * product_energy
+            + pair_energy_weight * pair_energy
+```
+
+The default current value is:
+
+```text
+pair_energy_weight = 0.50
+```
+
+The edge correlation state is updated by a differentiable local descent step:
+
+```text
+raw_corr_ij <- raw_corr_ij - corr_step * dE_pair/draw_corr_ij
+```
+
+For MaxCut edges this quickly learns negative correlation, which means "the two
+endpoints should prefer opposite bit values."
+
+#### 18.38.2 Why independent readout failed
+
+The first V15 tests showed a clear failure mode:
+
+```text
+p_i remains near 0.5 for almost all nodes
+corr_ij becomes strongly negative on almost all MaxCut edges
+pair energy decreases
+independent Bernoulli readout stays close to random
+```
+
+This happens because V15 can lower the pair-relaxed energy through the edge
+correlation channel without forcing node marginals to polarize into a global
+bitstring.  The learned information is mostly:
+
+```text
+edge relation: i and j should differ
+```
+
+not:
+
+```text
+absolute decision: i should be 0 and j should be 1
+```
+
+This is expected on random 3-regular MaxCut graphs.  Many cycles are frustrated:
+every edge can locally prefer anti-correlation, but those pair beliefs are not
+guaranteed to come from one globally consistent assignment.
+
+#### 18.38.3 Pair-guided readout
+
+To use the edge information, V15 now supports `pair_guided_eval`.  Instead of
+sampling nodes independently:
+
+```text
+x_i ~ Bernoulli(p_i)
+```
+
+the decoder samples roots and then propagates with edge conditionals:
+
+```text
+P(x_j | x_i) from B_ij(x_i, x_j)
+```
+
+The first version used a Python BFS per sample and was slow for grid scans.  It
+has now been replaced by a batched vectorized propagation decoder:
+
+```text
+quantum/warmstart/sampling.py::sample_pair_guided
+```
+
+The vectorized version keeps the same principle, but updates all samples and
+all currently exposed frontier nodes in tensor operations.  It also supports:
+
+```text
+--pair-guided-root-strategy random | confidence | confidence_random
+--pair-guided-root-mode sample | round
+--pair-guided-root-confidence-threshold
+--pair-guided-batch-size
+```
+
+The high-confidence root mode is intended to start from reliable node marginals
+and let each edge corr "supervise" the relative assignment of its two endpoints.
+
+#### 18.38.4 Pair relation collapse
+
+V15 now also has a mechanism that binds corr back into node dynamics.  The
+direct unnormalized sum
+
+```text
+sum_j |Q_ij| |corr_ij| sign(corr_ij) s_j
+```
+
+is not used as a raw field because it would scale poorly with graph density.
+Instead V15 computes a normalized relation target:
+
+```text
+s_i      = 2 p_i - 1
+r_ij     = sign(corr_ij)
+a_ij     = |Q_ij| * |corr_ij|
+
+target_i = sum_j a_ij * r_ij * s_j / sum_j a_ij
+error_i  = target_i - s_i
+signal_i = tanh(pair_relation_gain * error_i)
+```
+
+Interpretation:
+
+```text
+corr_ij > 0  -> i should align with j
+corr_ij < 0  -> i should anti-align with j
+```
+
+The signal is injected as a late RY collapse only when `pair_phase_mode`
+contains:
+
+```text
+pair_corr_collapse
+```
+
+Example:
+
+```bash
+python scripts/run_qubo_warmstart.py \
+  --benchmark random_regular_maxcut \
+  --model pair_aware \
+  --n 512 \
+  --average-degree 3 \
+  --seed 0 \
+  --epochs 80 \
+  --message-rounds 12 \
+  --pair-phase-mode pair_corr_collapse \
+  --pair-two-stage-fraction 0.60 \
+  --pair-collapse-init 0.06 \
+  --pair-relation-gain 1.5 \
+  --pair-symmetry-breaking random_rz_ry \
+  --pair-symmetry-strength 0.10 \
+  --pair-guided-root-strategy confidence \
+  --pair-guided-root-mode round
+```
+
+#### 18.38.5 Current n=512 seed-0 results
+
+Reference V14/GW numbers from the existing report:
+
+```text
+outputs/v14_maxcut3_report_n512_10seeds/seed_0/summary.json
+
+V14 SQNN expected C/W       = 0.874185
+V14 direct greedy C/W       = 0.903646
+GW expected C/W             = 0.880880
+```
+
+V15 pair-guided vectorized baseline:
+
+```text
+outputs/v15_pair_guided_vectorized_eval/n512_default_seed0
+
+independent+LS C/W          = 0.782552
+pair-guided raw C/W         = 0.761719
+pair-guided+LS C/W          = 0.868490
+pair-guided readout seconds = 0.0759 for 512 samples
+```
+
+Negative entropy / node polarization tests did not improve the result:
+
+| config | independent+LS | pair-guided+LS | p_std |
+|---|---:|---:|---:|
+| pair_w=0.5, final_entropy=-0.01 | 0.786458 | 0.864583 | 0.0105 |
+| pair_w=0.3, final_entropy=-0.01 | 0.783854 | 0.868490 | 0.0183 |
+| pair_w=0.3, final_entropy=-0.03 | 0.785156 | 0.865885 | 0.0185 |
+| pair_w=0.3, final_entropy=-0.10 | 0.782552 | 0.868490 | 0.0187 |
+| pair_w=0.1, final_entropy=-0.10 | 0.789063 | 0.860677 | 0.0540 |
+
+Pair relation collapse and high-confidence-root readout were also tested:
+
+| config | root | independent+LS | pair-guided raw | pair-guided+LS | p_std |
+|---|---|---:|---:|---:|---:|
+| confidence root only | confidence/round | 0.781250 | 0.757812 | 0.856771 | 0.0106 |
+| collapse 0.03, centered | confidence/round | 0.783854 | 0.759115 | 0.854167 | 0.0105 |
+| collapse 0.06, centered | confidence/round | 0.787760 | 0.757812 | 0.859375 | 0.0103 |
+| collapse 0.06, no-center | confidence/round | 0.783854 | 0.752604 | 0.867188 | 0.0103 |
+| collapse 0.06, no-center | random/sample | 0.783854 | 0.759115 | 0.861979 | 0.0103 |
+
+#### 18.38.6 Current V15 judgment
+
+The V15 components are useful diagnostically, but V15 is not yet better than
+the current V14 MaxCut-3 route.
+
+Current evidence:
+
+```text
+V15 pair-guided readout is much better than V15 independent readout.
+V15 pair-guided+LS is still below V14 direct greedy and GW expected.
+High-confidence roots are not reliable yet because node marginals are not
+trustworthy enough.
+Pair relation collapse polarizes only weakly and does not improve seed 0.
+```
+
+Mechanistic interpretation:
+
+```text
+V15 learns local pair anti-correlation.
+It does not yet learn a globally consistent assignment.
+Forcing node polarization with negative entropy produces weak or noisy
+polarization, not a reliable MaxCut partition.
+Using high-confidence roots is premature until the node marginals themselves
+become meaningful.
+```
+
+Recommended next V15 direction:
+
+```text
+1. Do not replace V14 with pure V15.
+2. Keep V15 as a pair-correlation component.
+3. Test V14 node dynamics + V15 pair-guided readout.
+4. If pair belief remains useful, add pair state to V14's clean edge-boost
+   route rather than training V15 as a standalone replacement.
+5. A stronger future version should enforce global consistency, e.g. through
+   multi-head assignments, cluster-level pair states, or readout-aware training,
+   rather than only independent edge pair marginals.
+```
+
+Code added in this V15 stage:
+
+```text
+quantum/warmstart/pair_aware_sqnn.py
+    QUBOPairAwarePhaseSQNN
+    pair-relaxed energy
+    raw_corr edge state
+    normalized pair relation collapse
+
+quantum/warmstart/sampling.py
+    vectorized sample_pair_guided
+    random / confidence root strategies
+
+scripts/run_qubo_warmstart.py
+    --model pair_aware
+    pair-guided eval fields
+    pair relation collapse CLI flags
+
+scripts/smoke_warmstart.py
+    pair energy consistency checks
+    corr direction checks
+    anti-correlated pair-guided readout checks
+```

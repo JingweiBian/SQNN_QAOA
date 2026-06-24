@@ -31,6 +31,7 @@ from quantum.warmstart import (
     QUBOInstanceEmbeddingWarmStartSQNN,
     QUBOMeanFieldWarmStart,
     QUBONodeOnlySQNN,
+    QUBOPairAwarePhaseSQNN,
     QUBOPositiveXSynchronousLocalFieldSQNN,
     QUBOQuantumDataWarmStartSQNN,
     QUBOSymmetricWarmStartSQNN,
@@ -50,6 +51,7 @@ from quantum.warmstart import (
     qaoa_ry_angles_from_probabilities,
     residual_qaoa_active_summary,
     sample_bernoulli,
+    sample_pair_guided,
 )
 from quantum.warmstart.losses import bernoulli_entropy
 
@@ -59,6 +61,7 @@ MODEL_REGISTRY = {
     "instance": QUBOInstanceEmbeddingWarmStartSQNN,
     "mean_field": QUBOMeanFieldWarmStart,
     "node_only": QUBONodeOnlySQNN,
+    "pair_aware": QUBOPairAwarePhaseSQNN,
     "quantum_data": QUBOQuantumDataWarmStartSQNN,
     "symmetric": QUBOSymmetricWarmStartSQNN,
     "sync_local": QUBOSynchronousLocalFieldSQNN,
@@ -98,6 +101,27 @@ def build_model(args, problem):
         return QUBOPositiveXSynchronousLocalFieldSQNN(
             num_variables=problem.num_variables,
             message_rounds=args.message_rounds,
+        )
+    if args.model == "pair_aware":
+        return QUBOPairAwarePhaseSQNN(
+            num_variables=problem.num_variables,
+            message_rounds=args.message_rounds,
+            symmetry_breaking=args.pair_symmetry_breaking,
+            symmetry_strength=args.pair_symmetry_strength,
+            symmetry_seed=args.seed if args.pair_symmetry_seed is None else args.pair_symmetry_seed,
+            pair_energy_weight=args.pair_energy_weight,
+            corr_step_init=args.corr_step_init,
+            corr_regularization=args.corr_regularization,
+            pair_relation_gain=args.pair_relation_gain,
+            pair_relation_center=args.pair_relation_center,
+            pair_relation_min_corr=args.pair_relation_min_corr,
+            phase_mode=args.pair_phase_mode,
+            phase_memory_decay=args.pair_phase_memory_decay,
+            two_stage_fraction=args.pair_two_stage_fraction,
+            collapse_init=args.pair_collapse_init,
+            z_message_gain=args.pair_z_message_gain,
+            z_message_gain_final=args.pair_z_message_gain_final,
+            rollback_aux_on_reject=True,
         )
     model_cls = MODEL_REGISTRY[args.model]
     return model_cls(
@@ -413,6 +437,71 @@ def evaluate_distribution(
     }
 
 
+def evaluate_pair_guided_distribution(
+    benchmark,
+    probabilities,
+    pair_belief,
+    num_samples,
+    local_search_passes,
+    best_known,
+    generator=None,
+    base_logit_weight=1.0,
+    pair_logit_weight=1.0,
+    temperature=1.0,
+    batch_size=None,
+    root_strategy="random",
+    root_mode="sample",
+    root_confidence_threshold=1e-6,
+):
+    problem = benchmark.problem
+    start = time.perf_counter()
+    samples = sample_pair_guided(
+        problem,
+        probabilities,
+        pair_belief,
+        num_samples=num_samples,
+        generator=generator,
+        base_logit_weight=base_logit_weight,
+        pair_logit_weight=pair_logit_weight,
+        temperature=temperature,
+        batch_size=batch_size,
+        root_strategy=root_strategy,
+        root_mode=root_mode,
+        root_confidence_threshold=root_confidence_threshold,
+    )
+    samples = samples.to(device=problem.linear.device, dtype=problem.linear.dtype)
+    energies = problem.energy(samples)
+    best_index = torch.argmin(energies)
+    sampled = samples[best_index]
+    sampled_energy = energies[best_index]
+    sampled_ls, sampled_ls_energy, sampled_flips = greedy_local_search(
+        problem,
+        sampled,
+        max_passes=local_search_passes,
+    )
+    elapsed = time.perf_counter() - start
+    return {
+        "num_samples": int(num_samples),
+        "readout_seconds": float(elapsed),
+        "base_logit_weight": float(base_logit_weight),
+        "pair_logit_weight": float(pair_logit_weight),
+        "temperature": float(temperature),
+        "batch_size": None if batch_size is None else int(batch_size),
+        "root_strategy": str(root_strategy),
+        "root_mode": str(root_mode),
+        "root_confidence_threshold": float(root_confidence_threshold),
+        "sampled_best_energy": float(sampled_energy.detach().cpu()),
+        "sampled_best_objective": float(objective_value(benchmark, sampled).detach().cpu()),
+        "sampled_best_ratio": ratio_value(benchmark, sampled, best_known),
+        "sampled_local_search_energy": float(sampled_ls_energy.detach().cpu()),
+        "sampled_local_search_objective": float(objective_value(benchmark, sampled_ls).detach().cpu()),
+        "sampled_local_search_ratio": ratio_value(benchmark, sampled_ls, best_known),
+        "sampled_local_search_flips": int(sampled_flips),
+        "sampled_mean_energy": float(energies.mean().detach().cpu()),
+        "sampled_energy_std": float(energies.std(unbiased=False).detach().cpu()),
+    }
+
+
 def train_model(args, benchmark, device):
     problem = benchmark.problem.to(device=device)
     benchmark.problem = problem
@@ -438,14 +527,22 @@ def train_model(args, benchmark, device):
         disable=args.no_progress,
     ):
         optimizer.zero_grad(set_to_none=True)
-        probabilities = model(problem)
+        training_state = None
+        if hasattr(model, "training_energy_from_state"):
+            training_state = model(problem, return_state=True)
+            probabilities = training_state["probabilities"]
+        else:
+            probabilities = model(problem)
         probabilities = torch.nan_to_num(
             probabilities,
             nan=0.5,
             posinf=1.0,
             neginf=0.0,
         ).clamp(0.0, 1.0)
-        energy = problem.expected_energy(probabilities)
+        if training_state is not None:
+            energy = model.training_energy_from_state(problem, training_state)
+        else:
+            energy = problem.expected_energy(probabilities)
         normalized_energy = energy / (problem.num_variables * problem.coefficient_scale())
         entropy = bernoulli_entropy(probabilities).mean()
         progress = epoch / max(args.epochs - 1, 1)
@@ -545,6 +642,35 @@ def main():
     parser.add_argument("--hidden-dim", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--pair-symmetry-breaking", default="none")
+    parser.add_argument("--pair-symmetry-strength", type=float, default=0.0)
+    parser.add_argument("--pair-symmetry-seed", type=int, default=None)
+    parser.add_argument("--pair-energy-weight", type=float, default=0.50)
+    parser.add_argument("--corr-step-init", type=float, default=0.10)
+    parser.add_argument("--corr-regularization", type=float, default=1e-3)
+    parser.add_argument("--pair-relation-gain", type=float, default=1.0)
+    parser.add_argument("--pair-relation-min-corr", type=float, default=0.0)
+    parser.add_argument("--no-pair-relation-center", dest="pair_relation_center", action="store_false")
+    parser.set_defaults(pair_relation_center=True)
+    parser.add_argument("--pair-phase-mode", default="baseline")
+    parser.add_argument("--pair-phase-memory-decay", type=float, default=0.0)
+    parser.add_argument("--pair-two-stage-fraction", type=float, default=0.0)
+    parser.add_argument("--pair-collapse-init", type=float, default=0.0)
+    parser.add_argument("--pair-z-message-gain", type=float, default=1.0)
+    parser.add_argument("--pair-z-message-gain-final", type=float, default=None)
+    parser.add_argument("--disable-pair-guided-readout", action="store_true")
+    parser.add_argument("--pair-guided-readout-samples", type=int, default=None)
+    parser.add_argument("--pair-guided-base-logit-weight", type=float, default=1.0)
+    parser.add_argument("--pair-guided-pair-logit-weight", type=float, default=1.0)
+    parser.add_argument("--pair-guided-temperature", type=float, default=1.0)
+    parser.add_argument("--pair-guided-batch-size", type=int, default=None)
+    parser.add_argument(
+        "--pair-guided-root-strategy",
+        choices=["random", "confidence", "confidence_random"],
+        default="random",
+    )
+    parser.add_argument("--pair-guided-root-mode", choices=["sample", "round"], default="sample")
+    parser.add_argument("--pair-guided-root-confidence-threshold", type=float, default=1e-6)
     parser.add_argument("--entropy-weight", type=float, default=0.02)
     parser.add_argument("--final-entropy-weight", type=float, default=0.001)
     parser.add_argument("--grad-clip", type=float, default=5.0)
@@ -603,6 +729,13 @@ def main():
         benchmark,
         device,
     )
+
+    pair_readout_state = None
+    if args.model == "pair_aware" and not args.disable_pair_guided_readout:
+        with torch.no_grad():
+            pair_readout_state = model(benchmark.problem, return_state=True)
+            probabilities = pair_readout_state["probabilities"]
+
     sqnn_eval = evaluate_distribution(
         benchmark,
         probabilities,
@@ -610,6 +743,28 @@ def main():
         local_search_passes=args.local_search_passes,
         best_known=best_known,
     )
+    pair_guided_eval = None
+    if pair_readout_state is not None:
+        pair_readout_samples = (
+            args.num_samples
+            if args.pair_guided_readout_samples is None
+            else args.pair_guided_readout_samples
+        )
+        pair_guided_eval = evaluate_pair_guided_distribution(
+            benchmark,
+            probabilities,
+            pair_readout_state["pair_belief"],
+            num_samples=pair_readout_samples,
+            local_search_passes=args.local_search_passes,
+            best_known=best_known,
+            base_logit_weight=args.pair_guided_base_logit_weight,
+            pair_logit_weight=args.pair_guided_pair_logit_weight,
+            temperature=args.pair_guided_temperature,
+            batch_size=args.pair_guided_batch_size,
+            root_strategy=args.pair_guided_root_strategy,
+            root_mode=args.pair_guided_root_mode,
+            root_confidence_threshold=args.pair_guided_root_confidence_threshold,
+        )
 
     if not has_known_optimum:
         observed_objectives = [
@@ -622,9 +777,18 @@ def main():
             sqnn_eval["repair_calibrated_sampled_best_objective"],
             sqnn_eval["repair_calibrated_sampled_local_search_objective"],
         ]
+        if pair_guided_eval is not None:
+            observed_objectives.extend(
+                [
+                    pair_guided_eval["sampled_best_objective"],
+                    pair_guided_eval["sampled_local_search_objective"],
+                ]
+            )
         best_observed_objective = max(observed_objectives)
         best_known = benchmark.problem.linear.new_tensor(best_observed_objective)
         _replace_objective_ratios(sqnn_eval, best_observed_objective)
+        if pair_guided_eval is not None:
+            _replace_objective_ratios(pair_guided_eval, best_observed_objective)
 
     baseline = {
         "random_best_energy": float(baseline_energy.detach().cpu()),
@@ -664,6 +828,7 @@ def main():
         "history": history,
         "baseline": baseline,
         "sqnn_eval": sqnn_eval,
+        "pair_guided_eval": pair_guided_eval,
         "qaoa_limits": qaoa_limits,
         "args": vars(args),
     }
@@ -705,6 +870,13 @@ def main():
             "repair_calibrated_sampled_local_search_ratio": sqnn_eval[
                 "repair_calibrated_sampled_local_search_ratio"
             ],
+            "pair_guided_sampled_ratio": None if pair_guided_eval is None else pair_guided_eval["sampled_best_ratio"],
+            "pair_guided_sampled_local_search_ratio": (
+                None if pair_guided_eval is None else pair_guided_eval["sampled_local_search_ratio"]
+            ),
+            "pair_guided_sampled_local_search_flips": (
+                None if pair_guided_eval is None else pair_guided_eval["sampled_local_search_flips"]
+            ),
             "full_qaoa_possible": qaoa_limits["p1"]["full_statevector_possible_on_gpu"],
             "repair_fix_t0p25_remaining_variables": repair_fix["threshold_0.25"]["remaining_variables"],
             "repair_fix_t0p25_qaoa_possible": repair_fix["threshold_0.25"]["residual_qaoa_limits"]["p1"]["full_statevector_possible_on_gpu"],

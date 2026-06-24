@@ -13,6 +13,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from quantum.warmstart import (
     QUBOProblem,
+    QUBOPairAwarePhaseSQNN,
     QUBOQuantumDataWarmStartSQNN,
     QUBOSynchronousLocalFieldSQNN,
     calibrate_probabilities_with_assignment,
@@ -23,6 +24,7 @@ from quantum.warmstart import (
     qubo_connected_components,
     reduce_by_fixing_isolated_variables,
     residual_qaoa_active_summary,
+    sample_pair_guided,
 )
 
 
@@ -92,6 +94,125 @@ def main():
     sync_loss.backward()
     if sync_grad_model.field_steps.grad is None:
         raise AssertionError("sync-local model did not receive gradients")
+
+    pair_model = QUBOPairAwarePhaseSQNN(
+        num_variables=problem.num_variables,
+        message_rounds=3,
+        pair_energy_weight=1.0,
+        corr_regularization=0.0,
+        monotone_accept=True,
+    )
+    raw_corr0 = pair_model._initial_raw_corr(problem)
+    p0 = torch.full((problem.num_variables,), 0.5)
+    pair_energy0 = pair_model.pair_expected_energy(
+        problem,
+        p0,
+        raw_corr0,
+        include_regularization=False,
+    )
+    product_energy0 = problem.expected_energy(p0)
+    if not torch.allclose(pair_energy0, product_energy0, atol=1e-6):
+        raise AssertionError(
+            f"corr=0 pair energy should match product energy: {pair_energy0} vs {product_energy0}"
+        )
+    pair_result = pair_model(problem, return_state=True)
+    pair_probabilities = pair_result["probabilities"]
+    if pair_probabilities.shape != (problem.num_variables,):
+        raise AssertionError(f"unexpected pair-aware probabilities shape: {pair_probabilities.shape}")
+    pair_belief = pair_result["pair_belief"].detach()
+    if pair_belief.numel() and not torch.allclose(
+        pair_belief.sum(dim=(-1, -2)),
+        torch.ones(pair_belief.shape[0], dtype=pair_belief.dtype, device=pair_belief.device),
+        atol=1e-5,
+    ):
+        raise AssertionError(f"invalid pair-belief normalization: {pair_belief}")
+    pair_energy_trace = pair_result["energy_trace"].detach()
+    if bool((pair_energy_trace[1:] > pair_energy_trace[:-1] + 1e-6).any()):
+        raise AssertionError(f"pair-aware energy increased: {pair_energy_trace}")
+
+    pair_grad_model = QUBOPairAwarePhaseSQNN(
+        num_variables=problem.num_variables,
+        message_rounds=3,
+        pair_energy_weight=1.0,
+        corr_regularization=0.0,
+        monotone_accept=False,
+    )
+    pair_grad_state = pair_grad_model(problem, return_state=True)
+    pair_grad_state["loss_energy"].backward()
+    if pair_grad_model.raw_corr_steps.grad is None:
+        raise AssertionError("pair-aware model did not receive corr-step gradients")
+
+    positive_edge_problem = QUBOProblem.from_terms(
+        num_variables=2,
+        linear=torch.zeros(2),
+        edge_index=torch.tensor([[0], [1]]),
+        edge_weight=torch.tensor([1.0]),
+    )
+    negative_edge_problem = QUBOProblem.from_terms(
+        num_variables=2,
+        linear=torch.zeros(2),
+        edge_index=torch.tensor([[0], [1]]),
+        edge_weight=torch.tensor([-1.0]),
+    )
+    pair_direction_model = QUBOPairAwarePhaseSQNN(
+        num_variables=2,
+        message_rounds=1,
+        pair_energy_weight=1.0,
+        corr_regularization=0.0,
+        monotone_accept=False,
+    )
+    midpoint = torch.full((2,), 0.5)
+    raw_zero = torch.zeros(1)
+    positive_next_corr = torch.tanh(
+        pair_direction_model._propose_raw_corr(positive_edge_problem, midpoint, raw_zero, 0)
+    )[0]
+    negative_next_corr = torch.tanh(
+        pair_direction_model._propose_raw_corr(negative_edge_problem, midpoint, raw_zero, 0)
+    )[0]
+    if not bool(positive_next_corr < 0.0):
+        raise AssertionError(f"positive edge should push corr negative, got {positive_next_corr}")
+    if not bool(negative_next_corr > 0.0):
+        raise AssertionError(f"negative edge should push corr positive, got {negative_next_corr}")
+
+    relation_model = QUBOPairAwarePhaseSQNN(
+        num_variables=2,
+        message_rounds=1,
+        pair_relation_center=False,
+    )
+    same_relation = relation_model._pair_relation_signal(
+        positive_edge_problem,
+        torch.tensor([0.8, 0.2]),
+        torch.tensor([2.0]),
+    )
+    if not bool(same_relation[0] < 0.0 and same_relation[1] > 0.0):
+        raise AssertionError(f"same-corr relation signal has wrong direction: {same_relation}")
+    anti_relation = relation_model._pair_relation_signal(
+        positive_edge_problem,
+        torch.tensor([0.8, 0.2]),
+        torch.tensor([-2.0]),
+    )
+    if not bool(anti_relation.abs().max() < 1e-5):
+        raise AssertionError(f"anti-corr satisfied relation should be near zero: {anti_relation}")
+
+    anti_pair_belief = torch.tensor([[[0.0, 0.5], [0.5, 0.0]]])
+    anti_samples = sample_pair_guided(
+        positive_edge_problem,
+        torch.full((2,), 0.5),
+        anti_pair_belief,
+        num_samples=16,
+    )
+    if not bool((anti_samples[:, 0] != anti_samples[:, 1]).all().item()):
+        raise AssertionError(f"pair-guided readout ignored anti-correlated pair belief: {anti_samples}")
+    rooted_anti_samples = sample_pair_guided(
+        positive_edge_problem,
+        torch.tensor([0.9, 0.5]),
+        anti_pair_belief,
+        num_samples=16,
+        root_strategy="confidence",
+        root_mode="round",
+    )
+    if not bool(((rooted_anti_samples[:, 0] == 1.0) & (rooted_anti_samples[:, 1] == 0.0)).all().item()):
+        raise AssertionError(f"high-confidence root did not propagate anti-correlation: {rooted_anti_samples}")
 
     positive_field_problem = QUBOProblem.from_terms(
         num_variables=1,

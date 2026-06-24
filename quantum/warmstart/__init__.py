@@ -38,6 +38,7 @@ from .preprocess import (
     reduce_by_fixing_isolated_variables,
     residual_qaoa_active_summary,
 )
+from .pair_aware_sqnn import QUBOPairAwarePhaseSQNN
 from .qaoa_limits import (
     max_statevector_qubits,
     qaoa_resource_summary,
@@ -76,6 +77,7 @@ from .qubo_sqnn import (
 from .sampling import (
     best_sample_from_probabilities,
     sample_bernoulli,
+    sample_pair_guided,
     sample_qubo_solutions,
 )
 
@@ -90,6 +92,7 @@ __all__ = [
     "QUBOInstanceEmbeddingWarmStartSQNN",
     "QUBOMeanFieldWarmStart",
     "QUBONodeOnlySQNN",
+    "QUBOPairAwarePhaseSQNN",
     "QUBOPositiveXSynchronousLocalFieldSQNN",
     "QUBOProblem",
     "QUBOQuantumDataWarmStartSQNN",
@@ -135,6 +138,7 @@ __all__ = [
     "reduce_by_fixing_isolated_variables",
     "residual_qaoa_active_summary",
     "sample_bernoulli",
+    "sample_pair_guided",
     "sample_qubo_solutions",
     "simulated_annealing",
     "statevector_memory_bytes",

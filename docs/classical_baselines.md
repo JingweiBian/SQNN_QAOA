@@ -82,6 +82,29 @@ status = FEASIBLE:
   只能报告 C/UB 和 C/C_best_known。
 ```
 
+### Simulated Annealing
+
+作用：
+
+```text
+1. 作为强 classical heuristic baseline；
+2. 作为 SQNN 平台期 escape 的候选模块；
+3. 检查 SQNN 的提升是否只是来自 classical post-processing。
+```
+
+当前记录：
+
+```text
+docs/reports/maxcut3_sa_baseline_and_escape.md
+```
+
+报告规则：
+
+```text
+SA-only 是 classical baseline。
+SQNN + SA-guided escape 是 hybrid solver，不计入 pure SQNN 指标。
+```
+
 ### SDP Upper Bound
 
 作用：

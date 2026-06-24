@@ -933,3 +933,273 @@ config.json 或等价配置
 ```
 
 其余结果放入独立实验报告或 `outputs/*/report.md`。
+
+---
+
+## 11. Classical SA 与 SA-Guided Escape 记录
+
+详细记录见：
+
+```text
+docs/reports/maxcut3_sa_baseline_and_escape.md
+```
+
+当前判断：
+
+```text
+1. Classical simulated annealing 是有价值的强启发式 baseline。
+   当前 CPU 通用 QUBO 实现已能快速跑到 n=4096；
+   10000 steps x 16 restarts 在 512/1024/2048/4096 上有明显质量提升。
+
+2. SQNN + SA-guided escape 能在 n=64 seed=0 的 exact C*=86 图上达到 C*，
+   但它是 hybrid solver，不属于 pure V10/V14 SQNN 指标。
+
+3. full SA-guided escape 太慢：
+   单 trial 约 63s。
+   更合理的 fast route 是训练阶段保持 monotone SQNN，
+   只在最终 forward 的后期触发 SA escape，并限制最多 1 到 3 次。
+
+4. 当前 fast final-only max-3-kick 配置在同一 n=64 exact 图上仍达到 C*=86，
+   单 trial 时间降到约 11s。
+```
+
+后续优先加速方向：
+
+```text
+1. MaxCut-3 专用 incremental SA：
+   维护每个点的 flip gain，翻点后只更新邻居，
+   避免当前通用 QUBO SA 每步重新扫全部 flip delta。
+
+2. active-set SA：
+   只对低置信变量或局部场矛盾变量退火。
+
+3. cascade escape：
+   先用便宜 greedy-guided escape，
+   无效时再触发 SA-guided escape。
+
+4. cache escape：
+   direct assignment 没有明显变化时不重复跑 SA。
+```
+
+### 11.1 n=512 15min 对比结论
+
+详细报告见：
+
+```text
+docs/reports/maxcut512_15min_classical_vs_sqnn_sa.md
+```
+
+本轮设置：
+
+```text
+n = 512, degree = 3, seed = 0, W = 768
+classical total budget = 900s
+SQNN+SA budget = 900s
+```
+
+关键结果：
+
+```text
+CP-SAT incumbent       C/W = 0.916667  (C = 704)
+CP-SAT upper bound     C/W = 0.934896  (UB = 718)
+GW + greedy            C/W = 0.912760  (C = 701)
+GW sampled-best        C/W = 0.904948  (C = 695)
+SQNN+SA best direct    C/W = 0.897135  (C = 689)
+```
+
+---
+
+## 12. Q-Tabu Bloch Anneal Probe
+
+Detailed report:
+
+```text
+docs/reports/v14_qtabu_anneal_probe.md
+```
+
+Main script:
+
+```text
+scripts/run_v14_qtabu_anneal_search.py
+```
+
+Purpose:
+
+```text
+Use tabu-search ideas as Bloch-dynamics control signals, without using tabu or
+classical local search as the final optimizer.
+```
+
+Mechanisms added:
+
+```text
+1. plateau/fixed trigger;
+2. gain-aware and conflict-aware active-set selection;
+3. qtabu_random small active set instead of full-node perturbation;
+4. short no-return memory after RY kicks;
+5. branch lookahead, then V14 continues from the selected Bloch state.
+```
+
+n=512, degree=3, seed=0 summary:
+
+```text
+base V14                 C_dg = 694, C_d = 688, C_exp = 671.374
+previous Bloch scan      C_dg = 699, C_d = 695, C_exp = 682.735
+Q-tabu best replay       C_dg = 700, C_d = 697, C_exp = 684.380
+```
+
+Best replay output:
+
+```text
+outputs/v14_qtabu_700_replay_n512_seed0
+```
+
+Current judgement:
+
+```text
+Q-tabu Bloch anneal is worth keeping as a V14 escape direction.
+It improves the Bloch-side best from 699 to 700 and raises direct readout to 697.
+It still does not reach the earlier classical tabu/CP-SAT region near 705.
+
+The best route is not hard deterministic gain flipping.
+Conflict-biased randomized active sets + mild no-return memory + branch
+lookahead work better.  Further manual scanning is likely inefficient; the next
+promising step is to make trigger/node/strength selection trainable or adaptive.
+```
+
+---
+
+## 13. Soft Global Bloch Anneal Probe
+
+Detailed report:
+
+```text
+docs/reports/v14_soft_global_anneal_probe.md
+```
+
+Main script:
+
+```text
+scripts/run_v14_soft_global_anneal_search.py
+```
+
+Purpose:
+
+```text
+Test a cleaner dynamical escape mechanism:
+global annealing is applied to all nodes, but conflicted/uncertain nodes receive
+larger node-dependent annealing strength rho_i.
+```
+
+Key distinction from Q-tabu:
+
+```text
+Q-tabu uses branch lookahead and selects a branch.
+Soft global anneal uses one continuous Bloch trajectory, with no branch
+selection and no classical tabu trajectory.
+```
+
+n=512, degree=3, seed=0 summary:
+
+```text
+base V14                 C_dg = 694, C_d = 688, C_exp = 671.374
+previous Bloch scan      C_dg = 699, C_d = 695, C_exp = 682.735
+Q-tabu best replay       C_dg = 700, C_d = 697, C_exp = 684.380
+Soft global best replay  C_dg = 702, C_d = 701, C_exp = 687.945
+```
+
+Best replay output:
+
+```text
+outputs/v14_soft_global_702_replay80_n512_seed0
+```
+
+Current judgement:
+
+```text
+Soft global Bloch anneal is currently the best Bloch-side escape mechanism.
+It is also easier to explain theoretically than Q-tabu because it is a single
+continuous dynamical trajectory.
+
+It still does not reach 705.  In 80 fixed-parameter replays, C_dg >= 700
+occurred 7/80 times and C_dg >= 702 occurred 2/80 times.  The next direction is
+to reduce stochasticity by learning/adapting rho_i, trigger time, and
+temperature schedule.
+```
+
+结论：
+
+```text
+当前加速 SQNN+SA 在 n=512 seed0 上还没有超过强经典。
+它超过 random+greedy 和本次 active-SA heuristic，
+但低于 GW sampled-best、GW+greedy 和 CP-SAT incumbent。
+下一步重点应从“加速”转到“提升 n=512 解质量”。
+```
+
+---
+
+## 14. Next Routes For Better Escape Quality
+
+Current speed and quality judgement:
+
+```text
+Soft global Bloch anneal is fast enough for n=512 exploration.
+The fixed best-parameter replay takes about 1.24s per case on CPU.
+
+The main bottleneck is not speed.  The main bottleneck is solution quality and
+reliability: in 80 replays, the best result reached C_dg = 702, but no replay
+reached the classical heuristic region near 705.
+```
+
+Near-term optimization routes:
+
+```text
+1. Adaptive anneal controller
+   Replace hand-tuned rho_i weights with an adaptive controller.
+   Inputs should include confidence, bad-edge count, flip gain, z-edge conflict,
+   and local-field magnitude.  Outputs should control node anneal strength,
+   RY perturbation direction, and whether to clear phase/memory.
+
+2. Bad-edge cluster coherent anneal
+   Move from independent node perturbations to cluster-level coherent rotations.
+   The active cluster should be built from connected bad-edge components or
+   high-conflict neighborhoods, so the escape can cross a basin boundary by
+   changing several coupled bits together.
+
+3. Gain-guided Bloch field
+   Inject MaxCut one-flip gain into the continuous Bloch dynamics instead of
+   using it only as a ranking signal.  Positive-gain nodes should receive a
+   stronger push toward flipping, cheap negative-gain nodes should be allowed
+   to cross barriers, and large negative-gain nodes should be protected.
+
+4. Short non-monotone recovery window
+   During escape, temporarily relax monotone accept for a small number of
+   rounds.  The model should be allowed to get worse briefly after the basin
+   jump, then return to monotone accept after recovery.
+
+5. Train-time anneal injection
+   Do not only attach escape after a trained V14 trajectory.  Randomly inject
+   soft-global anneal events during training so V14 learns how to recover from
+   perturbed Bloch states and continue lowering energy.
+```
+
+Preferred next experiment:
+
+```text
+Keep soft global Bloch anneal as the base escape mechanism because it is fast,
+continuous, and theoretically easier to analyze than branch-selection Q-tabu.
+
+The next experiment should compare:
+1. fixed hand-tuned rho_i;
+2. adaptive controller rho_i;
+3. cluster coherent anneal;
+4. gain-guided Bloch field;
+5. gain-guided + non-monotone recovery window.
+
+Primary target:
+n = 512, degree = 3, seed = 0, push best C_dg from 702 toward 705.
+
+Secondary target:
+test the best mechanism on multiple 512-node random 3-regular graph seeds to
+verify that the gain is not a single-graph artifact.
+```

@@ -108,9 +108,17 @@ def build_model(args, problem):
             message_rounds=args.message_rounds,
             symmetry_breaking=args.pair_symmetry_breaking,
             symmetry_strength=args.pair_symmetry_strength,
+            symmetry_strength_trainable=args.pair_symmetry_strength_trainable,
+            symmetry_strength_max=args.pair_symmetry_strength_max,
             symmetry_seed=args.seed if args.pair_symmetry_seed is None else args.pair_symmetry_seed,
+            trust_mode=args.pair_trust_mode,
+            trust_shrink=args.pair_trust_shrink,
+            trust_threshold=args.pair_trust_threshold,
             pair_energy_weight=args.pair_energy_weight,
+            pair_message_weight=args.pair_message_weight,
             corr_step_init=args.corr_step_init,
+            corr_preference_weight=args.corr_preference_weight,
+            corr_consistency_weight=args.corr_consistency_weight,
             corr_regularization=args.corr_regularization,
             pair_relation_gain=args.pair_relation_gain,
             pair_relation_center=args.pair_relation_center,
@@ -119,9 +127,11 @@ def build_model(args, problem):
             phase_memory_decay=args.pair_phase_memory_decay,
             two_stage_fraction=args.pair_two_stage_fraction,
             collapse_init=args.pair_collapse_init,
+            final_rotation_max=args.pair_final_rotation_max,
             z_message_gain=args.pair_z_message_gain,
             z_message_gain_final=args.pair_z_message_gain_final,
-            rollback_aux_on_reject=True,
+            z_message_gain_schedule_start=args.pair_z_message_gain_schedule_start,
+            rollback_aux_on_reject=args.pair_rollback_aux_on_reject,
         )
     model_cls = MODEL_REGISTRY[args.model]
     return model_cls(
@@ -654,22 +664,38 @@ def main():
     parser.add_argument("--hidden-dim", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--pair-symmetry-breaking", default="none")
-    parser.add_argument("--pair-symmetry-strength", type=float, default=0.0)
+    parser.add_argument("--pair-symmetry-breaking", default="random_ry")
+    parser.add_argument("--pair-symmetry-strength", type=float, default=0.10)
+    parser.add_argument("--pair-symmetry-strength-max", type=float, default=0.50)
+    parser.add_argument(
+        "--no-pair-symmetry-strength-trainable",
+        dest="pair_symmetry_strength_trainable",
+        action="store_false",
+    )
+    parser.set_defaults(pair_symmetry_strength_trainable=True)
     parser.add_argument("--pair-symmetry-seed", type=int, default=None)
-    parser.add_argument("--pair-energy-weight", type=float, default=0.50)
+    parser.add_argument("--pair-trust-mode", choices=["fixed", "adaptive", "two_stage"], default="two_stage")
+    parser.add_argument("--pair-trust-shrink", type=float, default=0.25)
+    parser.add_argument("--pair-trust-threshold", type=float, default=1e-4)
+    parser.add_argument("--pair-energy-weight", type=float, default=0.0)
+    parser.add_argument("--pair-message-weight", type=float, default=0.50)
     parser.add_argument("--corr-step-init", type=float, default=0.10)
+    parser.add_argument("--corr-preference-weight", type=float, default=1.0)
+    parser.add_argument("--corr-consistency-weight", type=float, default=0.10)
     parser.add_argument("--corr-regularization", type=float, default=1e-3)
     parser.add_argument("--pair-relation-gain", type=float, default=1.0)
     parser.add_argument("--pair-relation-min-corr", type=float, default=0.0)
     parser.add_argument("--no-pair-relation-center", dest="pair_relation_center", action="store_false")
     parser.set_defaults(pair_relation_center=True)
-    parser.add_argument("--pair-phase-mode", default="baseline")
-    parser.add_argument("--pair-phase-memory-decay", type=float, default=0.0)
-    parser.add_argument("--pair-two-stage-fraction", type=float, default=0.0)
-    parser.add_argument("--pair-collapse-init", type=float, default=0.0)
-    parser.add_argument("--pair-z-message-gain", type=float, default=1.0)
-    parser.add_argument("--pair-z-message-gain-final", type=float, default=None)
+    parser.add_argument("--pair-phase-mode", default="memory_z_edge_cavity_collapse")
+    parser.add_argument("--pair-phase-memory-decay", type=float, default=0.60)
+    parser.add_argument("--pair-two-stage-fraction", type=float, default=0.60)
+    parser.add_argument("--pair-collapse-init", type=float, default=0.06)
+    parser.add_argument("--pair-final-rotation-max", type=float, default=0.05)
+    parser.add_argument("--pair-z-message-gain", type=float, default=1.8)
+    parser.add_argument("--pair-z-message-gain-final", type=float, default=2.6)
+    parser.add_argument("--pair-z-message-gain-schedule-start", type=float, default=0.55)
+    parser.add_argument("--pair-rollback-aux-on-reject", action="store_true")
     parser.add_argument("--disable-pair-guided-readout", action="store_true")
     parser.add_argument("--pair-guided-readout-samples", type=int, default=None)
     parser.add_argument("--pair-guided-base-logit-weight", type=float, default=1.0)
@@ -766,11 +792,20 @@ def main():
         else:
             pair_expected_energy = pair_readout_state["pair_expected_energy"]
         loss_energy = pair_readout_state.get("loss_energy")
+        corr = pair_readout_state.get("corr")
         sqnn_eval["pair_expected_energy"] = float(pair_expected_energy.detach().cpu())
         sqnn_eval["pair_expected_objective"] = float((-pair_expected_energy).detach().cpu())
         sqnn_eval["pair_expected_ratio"] = expected_ratio_from_energy(pair_expected_energy, best_known)
         if loss_energy is not None:
             sqnn_eval["training_loss_energy"] = float(loss_energy.detach().cpu())
+        if corr is not None:
+            sqnn_eval["corr_mean"] = float(corr.mean().detach().cpu())
+            sqnn_eval["corr_abs_mean"] = float(corr.abs().mean().detach().cpu())
+            sqnn_eval["corr_std"] = float(corr.std(unbiased=False).detach().cpu())
+        if "corr_consistency_trace" in pair_readout_state:
+            sqnn_eval["corr_consistency_energy"] = float(
+                pair_readout_state["corr_consistency_trace"][-1].detach().cpu()
+            )
     pair_guided_eval = None
     if pair_readout_state is not None:
         pair_readout_samples = (

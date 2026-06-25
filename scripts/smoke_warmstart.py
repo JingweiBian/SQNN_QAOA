@@ -174,6 +174,35 @@ def main():
     if not bool(negative_next_corr > 0.0):
         raise AssertionError(f"negative edge should push corr positive, got {negative_next_corr}")
 
+    consistency_model = QUBOPairAwarePhaseSQNN(
+        num_variables=2,
+        message_rounds=1,
+        corr_consistency_weight=1.0,
+        pair_message_weight=1.0,
+    )
+    unsupported_corr_energy = consistency_model.corr_consistency_energy(
+        positive_edge_problem,
+        torch.tensor([0.5, 0.5]),
+        torch.tensor([2.0]),
+    )
+    supported_corr_energy = consistency_model.corr_consistency_energy(
+        positive_edge_problem,
+        torch.tensor([0.99, 0.99]),
+        torch.tensor([2.0]),
+    )
+    if not bool(unsupported_corr_energy > supported_corr_energy):
+        raise AssertionError(
+            "unsupported edge corr should be penalized more than node-supported corr: "
+            f"{unsupported_corr_energy} <= {supported_corr_energy}"
+        )
+    consistency_field = consistency_model._corr_consistency_field(
+        positive_edge_problem,
+        torch.tensor([0.8, 0.2]),
+        torch.tensor([2.0]),
+    )
+    if not bool(consistency_field[0] > 0.0 and consistency_field[1] < 0.0):
+        raise AssertionError(f"consistency field has wrong direction: {consistency_field}")
+
     relation_model = QUBOPairAwarePhaseSQNN(
         num_variables=2,
         message_rounds=1,

@@ -41,10 +41,10 @@ class QUBOPairAwarePhaseSQNN(PhaseAwareJRegularizedSQNN):
     - ``corr=-1`` gives maximum negative correlation
       ``q_ij=max(0,p_i+p_j-1)``.
 
-    The internal descent objective can blend the product energy and pair-belief
-    energy.  ``pair_energy_weight=0`` recovers the V14 product-energy objective
-    for acceptance/loss, while ``pair_energy_weight=1`` uses the pure pair
-    relaxed energy.
+    The internal descent objective keeps the V14 product energy as the anchor.
+    The pair-relaxed energy can still be blended in for ablations, but the
+    default V15 path uses the edge correlation state as an auxiliary message
+    and penalizes correlations that are not supported by node polarization.
     """
 
     def __init__(
@@ -89,10 +89,13 @@ class QUBOPairAwarePhaseSQNN(PhaseAwareJRegularizedSQNN):
         z_message_confidence_damping=0.0,
         node_step_mode="none",
         rollback_aux_on_reject=True,
-        pair_energy_weight=0.50,
+        pair_energy_weight=0.0,
+        pair_message_weight=0.50,
         corr_step_init=0.10,
         corr_memory_decay=1.0,
         corr_gradient_clip=3.0,
+        corr_preference_weight=1.0,
+        corr_consistency_weight=0.10,
         corr_regularization=1e-3,
         pair_relation_gain=1.0,
         pair_relation_center=True,
@@ -141,8 +144,11 @@ class QUBOPairAwarePhaseSQNN(PhaseAwareJRegularizedSQNN):
             rollback_aux_on_reject=rollback_aux_on_reject,
         )
         self.pair_energy_weight = float(pair_energy_weight)
+        self.pair_message_weight = float(pair_message_weight)
         self.corr_memory_decay = float(corr_memory_decay)
         self.corr_gradient_clip = float(corr_gradient_clip)
+        self.corr_preference_weight = float(corr_preference_weight)
+        self.corr_consistency_weight = float(corr_consistency_weight)
         self.corr_regularization = float(corr_regularization)
         self.pair_relation_gain = float(pair_relation_gain)
         self.pair_relation_center = bool(pair_relation_center)
@@ -258,20 +264,45 @@ class QUBOPairAwarePhaseSQNN(PhaseAwareJRegularizedSQNN):
             energy = energy + float(self.corr_regularization) * scale * (terms["corr"] * terms["corr"]).mean()
         return energy
 
+    def corr_regularization_energy(self, problem, raw_corr):
+        if problem.edge_index.numel() == 0 or self.corr_regularization <= 0.0:
+            return problem.linear.new_tensor(0.0).to(device=self.device, dtype=self.dtype)
+        corr = torch.tanh(raw_corr.to(device=self.device, dtype=self.dtype))
+        scale = problem.coefficient_scale().to(device=self.device, dtype=self.dtype)
+        return float(self.corr_regularization) * scale * (corr * corr).mean()
+
+    def corr_consistency_energy(self, problem, probabilities, raw_corr):
+        if problem.edge_index.numel() == 0 or self.corr_consistency_weight <= 0.0:
+            return problem.linear.new_tensor(0.0).to(device=self.device, dtype=self.dtype)
+        src, dst = problem.edge_index
+        p = probabilities.to(device=self.device, dtype=self.dtype).clamp(0.0, 1.0)
+        corr = torch.tanh(raw_corr.to(device=self.device, dtype=self.dtype))
+        polarity = 2.0 * p - 1.0
+        target_corr = polarity[src] * polarity[dst]
+        edge_abs = problem.edge_weight.to(device=self.device, dtype=self.dtype).abs()
+        normalizer = edge_abs.sum().clamp_min(1e-12)
+        mismatch = corr - target_corr
+        scale = problem.coefficient_scale().to(device=self.device, dtype=self.dtype)
+        return float(self.corr_consistency_weight) * scale * (edge_abs * mismatch * mismatch).sum() / normalizer
+
     def blended_expected_energy(self, problem, probabilities, raw_corr, *, include_regularization=True):
         weight = min(max(float(self.pair_energy_weight), 0.0), 1.0)
         product = problem.expected_energy(probabilities)
-        if weight <= 0.0:
-            return product
-        pair = self.pair_expected_energy(
-            problem,
-            probabilities,
-            raw_corr,
-            include_regularization=include_regularization,
-        )
-        return (1.0 - weight) * product + weight * pair
+        energy = product
+        if weight > 0.0:
+            pair = self.pair_expected_energy(
+                problem,
+                probabilities,
+                raw_corr,
+                include_regularization=False,
+            )
+            energy = energy + weight * (pair - product)
+        if include_regularization:
+            energy = energy + self.corr_consistency_energy(problem, probabilities, raw_corr)
+            energy = energy + self.corr_regularization_energy(problem, raw_corr)
+        return energy
 
-    def _pair_local_field(self, problem, probabilities, raw_corr):
+    def _pair_energy_local_field(self, problem, probabilities, raw_corr):
         field = problem.linear.to(device=self.device, dtype=self.dtype).clone()
         terms = self._pair_terms(problem, probabilities, raw_corr)
         if problem.edge_index.numel():
@@ -289,10 +320,46 @@ class QUBOPairAwarePhaseSQNN(PhaseAwareJRegularizedSQNN):
             )
             field = field / normalizer.clamp_min(1e-6)
 
+        return field
+
+    def _corr_consistency_field(self, problem, probabilities, raw_corr):
+        field = torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
+        if problem.edge_index.numel() == 0:
+            return field
+
+        src, dst = problem.edge_index
+        p = probabilities.to(device=self.device, dtype=self.dtype).clamp(0.0, 1.0)
+        corr = torch.tanh(raw_corr.to(device=self.device, dtype=self.dtype))
+        polarity = 2.0 * p - 1.0
+        src_polarity = polarity[src]
+        dst_polarity = polarity[dst]
+        mismatch = corr - src_polarity * dst_polarity
+        edge_abs = problem.edge_weight.to(device=self.device, dtype=self.dtype).abs()
+
+        field.index_add_(0, src, -4.0 * edge_abs * mismatch * dst_polarity)
+        field.index_add_(0, dst, -4.0 * edge_abs * mismatch * src_polarity)
+        normalizer = problem.node_degrees(weighted=True, absolute=True).to(
+            device=self.device,
+            dtype=self.dtype,
+        )
+        return field / normalizer.clamp_min(1e-6)
+
+    def _pair_local_field(self, problem, probabilities, raw_corr):
+        product_field = self._local_field(problem, probabilities)
         weight = min(max(float(self.pair_energy_weight), 0.0), 1.0)
-        if weight <= 0.0:
-            return product_field
-        return (1.0 - weight) * product_field + weight * field
+        field = product_field
+        if weight > 0.0:
+            pair_field = self._pair_energy_local_field(problem, probabilities, raw_corr)
+            field = (1.0 - weight) * product_field + weight * pair_field
+
+        message_weight = max(float(self.pair_message_weight), 0.0)
+        if message_weight > 0.0:
+            field = field + message_weight * self._corr_consistency_field(
+                problem,
+                probabilities,
+                raw_corr,
+            )
+        return field
 
     def _pair_relation_signal(self, problem, probabilities, raw_corr):
         signal = torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
@@ -348,7 +415,25 @@ class QUBOPairAwarePhaseSQNN(PhaseAwareJRegularizedSQNN):
             return raw_corr
         terms = self._pair_terms(problem, probabilities, raw_corr)
         edge_weight = problem.edge_weight.to(device=self.device, dtype=self.dtype)
-        gradient = edge_weight * terms["dq_draw"]
+        gradient = float(self.corr_preference_weight) * edge_weight * terms["dq_draw"]
+        if self.corr_consistency_weight > 0.0:
+            src, dst = problem.edge_index
+            p = probabilities.to(device=self.device, dtype=self.dtype).clamp(0.0, 1.0)
+            polarity = 2.0 * p - 1.0
+            corr = terms["corr"]
+            target_corr = polarity[src] * polarity[dst]
+            edge_abs = edge_weight.abs()
+            normalizer = edge_abs.sum().clamp_min(1e-12)
+            scale = problem.coefficient_scale().to(device=self.device, dtype=self.dtype)
+            gradient = gradient + (
+                2.0
+                * float(self.corr_consistency_weight)
+                * scale
+                * edge_abs
+                * (corr - target_corr)
+                * (1.0 - corr * corr)
+                / normalizer
+            )
         if self.corr_regularization > 0.0:
             corr = terms["corr"]
             scale = problem.coefficient_scale().to(device=self.device, dtype=self.dtype)
@@ -382,6 +467,7 @@ class QUBOPairAwarePhaseSQNN(PhaseAwareJRegularizedSQNN):
         energy_trace = [current_energy]
         product_energy_trace = [problem.expected_energy(probabilities)]
         pair_energy_trace = [self.pair_expected_energy(problem, probabilities, raw_corr)]
+        corr_consistency_trace = [self.corr_consistency_energy(problem, probabilities, raw_corr)]
         probability_trace = [probabilities]
         bloch_trace = [bloch]
         raw_corr_trace = [raw_corr]
@@ -452,6 +538,7 @@ class QUBOPairAwarePhaseSQNN(PhaseAwareJRegularizedSQNN):
             energy_trace.append(current_energy)
             product_energy_trace.append(problem.expected_energy(probabilities))
             pair_energy_trace.append(self.pair_expected_energy(problem, probabilities, raw_corr))
+            corr_consistency_trace.append(self.corr_consistency_energy(problem, probabilities, raw_corr))
             probability_trace.append(probabilities)
             bloch_trace.append(bloch)
             raw_corr_trace.append(raw_corr)
@@ -471,6 +558,7 @@ class QUBOPairAwarePhaseSQNN(PhaseAwareJRegularizedSQNN):
         energy_trace[-1] = current_energy
         product_energy_trace[-1] = problem.expected_energy(probabilities)
         pair_energy_trace[-1] = self.pair_expected_energy(problem, probabilities, raw_corr)
+        corr_consistency_trace[-1] = self.corr_consistency_energy(problem, probabilities, raw_corr)
         probability_trace[-1] = probabilities
         bloch_trace[-1] = bloch
 
@@ -487,6 +575,7 @@ class QUBOPairAwarePhaseSQNN(PhaseAwareJRegularizedSQNN):
                 "energy_trace": torch.stack(energy_trace),
                 "product_energy_trace": torch.stack(product_energy_trace),
                 "pair_energy_trace": torch.stack(pair_energy_trace),
+                "corr_consistency_trace": torch.stack(corr_consistency_trace),
                 "probability_trace": torch.stack(probability_trace),
                 "bloch_trace": torch.stack(bloch_trace),
                 "raw_corr_trace": torch.stack(raw_corr_trace),

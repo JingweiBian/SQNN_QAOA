@@ -192,16 +192,24 @@ def ratio_value(benchmark, assignment, best_known):
     return float((value / torch.as_tensor(best_known, device=value.device)).detach().cpu())
 
 
+def expected_ratio_from_energy(expected_energy, best_known):
+    value = -expected_energy
+    return float((value / torch.as_tensor(best_known, device=value.device)).detach().cpu())
+
+
 def _replace_objective_ratios(eval_report, best_observed_objective):
     best_observed_objective = float(best_observed_objective)
     if abs(best_observed_objective) < 1e-12:
         return
 
     objective_ratio_pairs = {
+        "expected_ratio": "expected_objective",
         "rounded_ratio": "rounded_objective",
         "rounded_local_search_ratio": "rounded_local_search_objective",
         "sampled_best_ratio": "sampled_best_objective",
         "sampled_local_search_ratio": "sampled_local_search_objective",
+        "pair_expected_ratio": "pair_expected_objective",
+        "repair_calibrated_expected_ratio": "repair_calibrated_expected_objective",
         "repair_calibrated_sampled_best_ratio": "repair_calibrated_sampled_best_objective",
         "repair_calibrated_sampled_local_search_ratio": "repair_calibrated_sampled_local_search_objective",
     }
@@ -378,9 +386,13 @@ def evaluate_distribution(
     raw_fixed_reports = fixed_subproblem_reports(rounded_values)
     rounded_ls_fixed_reports = fixed_subproblem_reports(rounded_ls)
     sampled_ls_fixed_reports = fixed_subproblem_reports(sampled_ls)
+    expected_energy = problem.expected_energy(probabilities)
+    repair_expected_energy = problem.expected_energy(repair_calibrated_probabilities)
 
     return {
-        "expected_energy": float(problem.expected_energy(probabilities).detach().cpu()),
+        "expected_energy": float(expected_energy.detach().cpu()),
+        "expected_objective": float((-expected_energy).detach().cpu()),
+        "expected_ratio": expected_ratio_from_energy(expected_energy, best_known),
         "probability_mean": float(probabilities.mean().detach().cpu()),
         "probability_std": float(probabilities.std(unbiased=False).detach().cpu()),
         "mean_confidence_abs_p_minus_half": float(confidence.mean().detach().cpu()),
@@ -407,9 +419,9 @@ def evaluate_distribution(
         "sampled_local_search_objective": float(objective_value(benchmark, sampled_ls).detach().cpu()),
         "sampled_local_search_ratio": ratio_value(benchmark, sampled_ls, best_known),
         "sampled_local_search_flips": int(sampled_flips),
-        "repair_calibrated_expected_energy": float(
-            problem.expected_energy(repair_calibrated_probabilities).detach().cpu()
-        ),
+        "repair_calibrated_expected_energy": float(repair_expected_energy.detach().cpu()),
+        "repair_calibrated_expected_objective": float((-repair_expected_energy).detach().cpu()),
+        "repair_calibrated_expected_ratio": expected_ratio_from_energy(repair_expected_energy, best_known),
         "repair_calibrated_mean_confidence_abs_p_minus_half": float(
             (repair_calibrated_probabilities - 0.5).abs().mean().detach().cpu()
         ),
@@ -743,6 +755,22 @@ def main():
         local_search_passes=args.local_search_passes,
         best_known=best_known,
     )
+    if pair_readout_state is not None:
+        if hasattr(model, "pair_expected_energy"):
+            pair_expected_energy = model.pair_expected_energy(
+                benchmark.problem,
+                probabilities,
+                pair_readout_state["raw_corr"],
+                include_regularization=False,
+            )
+        else:
+            pair_expected_energy = pair_readout_state["pair_expected_energy"]
+        loss_energy = pair_readout_state.get("loss_energy")
+        sqnn_eval["pair_expected_energy"] = float(pair_expected_energy.detach().cpu())
+        sqnn_eval["pair_expected_objective"] = float((-pair_expected_energy).detach().cpu())
+        sqnn_eval["pair_expected_ratio"] = expected_ratio_from_energy(pair_expected_energy, best_known)
+        if loss_energy is not None:
+            sqnn_eval["training_loss_energy"] = float(loss_energy.detach().cpu())
     pair_guided_eval = None
     if pair_readout_state is not None:
         pair_readout_samples = (
@@ -863,9 +891,11 @@ def main():
             "best_epoch": best_epoch,
             "random_best_ratio": baseline["random_best_ratio"],
             "random_local_search_ratio": baseline["random_local_search_ratio"],
+            "sqnn_expected_ratio": sqnn_eval["expected_ratio"],
             "sqnn_sampled_ratio": sqnn_eval["sampled_best_ratio"],
             "sqnn_sampled_local_search_ratio": sqnn_eval["sampled_local_search_ratio"],
             "sqnn_sampled_local_search_flips": sqnn_eval["sampled_local_search_flips"],
+            "pair_expected_ratio": sqnn_eval.get("pair_expected_ratio"),
             "repair_calibrated_sampled_ratio": sqnn_eval["repair_calibrated_sampled_best_ratio"],
             "repair_calibrated_sampled_local_search_ratio": sqnn_eval[
                 "repair_calibrated_sampled_local_search_ratio"

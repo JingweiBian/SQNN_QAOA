@@ -95,7 +95,7 @@ status = FEASIBLE:
 当前记录：
 
 ```text
-docs/reports/maxcut3_sa_baseline_and_escape.md
+maxcut/v14_utc/reports/archive/maxcut3_sa_baseline_and_escape.md
 ```
 
 报告规则：

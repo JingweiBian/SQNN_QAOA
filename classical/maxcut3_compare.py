@@ -543,6 +543,10 @@ def build_phase_aware_model(config: dict, benchmark, device: torch.device):
             else float(config.get("z_message_gain_final"))
         ),
         z_message_gain_schedule_start=float(config.get("z_message_gain_schedule_start", 0.60)),
+        density_reference_degree=float(config.get("density_reference_degree", 3.0)),
+        dense_field_scale_power=float(config.get("dense_field_scale_power", 0.0)),
+        dense_z_error_scale_power=float(config.get("dense_z_error_scale_power", 0.0)),
+        dense_signal_scale_max=float(config.get("dense_signal_scale_max", 3.0)),
         node_step_mode=config.get("node_step_mode", "none"),
         rollback_aux_on_reject=bool(config.get("rollback_aux_on_reject", False)),
     )

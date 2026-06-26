@@ -12,14 +12,12 @@ Compatibility wrappers remain for the general SQNN paths, such as
 `quantum.layers`, `quantum.group_encoder`, `quantum.networkmodels`, and
 `quantum.trainer`.
 
-Warm-start experiment entry points:
+Current experiment entry points:
 
-- `scripts/run_qubo_warmstart.py`: train/evaluate SQNN warm-start models on large QUBO MaxCut benchmarks.
-- `scripts/summarize_warmstart_runs.py`: aggregate `metrics.json` files into CSV/Markdown tables.
-- `scripts/plot_warmstart_run.py`: generate a compact quality/residual plot for one run.
-- `scripts/run_residual_qaoa_demo.py`: run small statevector QAOA on a fixed residual QUBO, including isolated-variable fixing and optional component-wise mode.
-- `scripts/run_warmstart_sweep.py`: run controlled multi-seed sweeps with per-run timeout.
-- `scripts/smoke_warmstart.py`: run lightweight correctness checks for QUBO preprocessing and residual QAOA.
+- `scripts/run_qubo_warmstart.py`: legacy warm-start train/evaluate entry point.
+- `scripts/README_V14_UTC.md`: formal V14-UTC MaxCut runner index.
+- `maxcut/v14_utc/`: frozen sparse MaxCut method documentation.
+- `maxcut/v18_dissipative/`: active dense-graph development direction.
 
 Supported large-QUBO benchmarks include `planted_maxcut`,
 `random_maxcut`, and `planted_parity`. `planted_maxcut` and

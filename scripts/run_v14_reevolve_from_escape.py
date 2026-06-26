@@ -68,6 +68,27 @@ def find_v14_run_dir(args: argparse.Namespace) -> Path | None:
                 continue
             if int(config.get("seed", -999999)) != int(args.seed):
                 continue
+            if hasattr(args, "degree"):
+                expected_degree = float(getattr(args, "degree"))
+                actual_degree = float(config.get("average_degree", expected_degree))
+                if abs(actual_degree - expected_degree) > 1e-9:
+                    continue
+            skip_run = False
+            for key in [
+                "density_reference_degree",
+                "dense_field_scale_power",
+                "dense_z_error_scale_power",
+                "dense_signal_scale_max",
+            ]:
+                if not hasattr(args, key):
+                    continue
+                expected_value = float(getattr(args, key))
+                actual_value = float(config.get(key, 3.0 if key == "density_reference_degree" else (3.0 if key == "dense_signal_scale_max" else 0.0)))
+                if abs(actual_value - expected_value) > 1e-9:
+                    skip_run = True
+                    break
+            if skip_run:
+                continue
         except Exception:
             continue
         runs.append(path)
@@ -110,6 +131,18 @@ def load_or_train_v14(args: argparse.Namespace, device: torch.device):
         head_count=int(args.head_count),
         head_seed_stride=int(args.head_seed_stride),
     )
+    if hasattr(args, "degree"):
+        config["average_degree"] = float(getattr(args, "degree"))
+    for key in [
+        "density_reference_degree",
+        "dense_field_scale_power",
+        "dense_z_error_scale_power",
+        "dense_signal_scale_max",
+    ]:
+        if hasattr(args, key):
+            config[key] = float(getattr(args, key))
+    if float(config.get("dense_field_scale_power", 0.0)) or float(config.get("dense_z_error_scale_power", 0.0)):
+        config["phase"] = f"{config['phase']}_dense_scale"
     config["num_samples"] = int(args.sample_count)
     config["local_search_passes"] = int(args.greedy_passes)
     model, benchmark = load_trained_model(config, training_dir, device)

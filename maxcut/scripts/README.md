@@ -1,17 +1,23 @@
 # MaxCut Scripts
 
-Historical MaxCut entry points currently remain in the repository-level
-`scripts/` directory to avoid breaking existing reports and commands.
+Formal runnable MaxCut entry points currently remain in the repository-level
+`scripts/` directory to avoid breaking existing commands.
 
-Important current scripts include:
+Current V14-UTC entry points:
 
 ```text
-scripts/run_maxcut3_phase_aware_probe.py
-scripts/run_v14_bloch_anneal_escape.py
-scripts/run_v14_soft_global_anneal_search.py
-scripts/run_v14_qtabu_anneal_search.py
-scripts/run_maxcut512_classical_vs_sqnn_sa.py
+scripts/README_V14_UTC.md
+scripts/run_v14_four_scheme_seed_benchmark.py
+scripts/run_v14_four_scheme_random50_all.sh
+scripts/merge_v14_four_scheme_seed_benchmark.py
 ```
 
-New MaxCut-only runners should be created here first, or wrapped here while the
-old path remains available for compatibility.
+Archived V14-only helper scripts that used to be here are now in:
+
+```text
+maxcut/v14_utc/scripts_archive/
+```
+
+New MaxCut-only runners can be drafted here, but mature shared runners should
+be promoted to the top-level `scripts/` directory only when they are intended
+as stable entry points.

@@ -225,7 +225,9 @@ def metropolis_accept(
     if float(temperature) <= 0.0:
         return False
     probability = math.exp(-delta / max(float(temperature), 1e-12))
-    sample = float(torch.rand((), generator=generator).detach().cpu())
+    sample = float(
+        torch.rand((), dtype=current_energy.dtype, device=current_energy.device, generator=generator).detach().cpu()
+    )
     return sample < probability
 
 

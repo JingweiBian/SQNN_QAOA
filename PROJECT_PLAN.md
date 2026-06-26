@@ -2,13 +2,41 @@
 
 本文是当前项目的规范主计划。旧版计划书里大量逐轮日志、路线名和临时实验记录已经不再放在主计划里；历史细节以 Git 历史、独立报告和 `outputs/*/report.md` 为准。
 
+## 2026-06-26 当前状态
+
+当前项目已经分成两条清晰路线：
+
+```text
+V14-UTC:
+  正式冻结为 sparse MaxCut 演示方案。
+  主目录：maxcut/v14_utc/
+  正式输出：outputs/final_v14_utc/
+  适用范围：random regular MaxCut 的 d=3/4 低度稀疏图。
+
+V18 dissipative:
+  当前下一步开发路线。
+  主目录：maxcut/v18_dissipative/
+  参考输出：outputs/v18_dissipative_dense_probe/
+  目标范围：更稠密图上的快速耗散 Bloch 动力学。
+```
+
+V14-UTC 的论文叙事不再是“继续往 V14 上叠加更多跳盆机制”，而是：
+
+```text
+V10 建立 monotone local-field SQNN 基线；
+V14 建立 phase/memory/cavity Bloch 动力学；
+V14-UTC 用 direct-readout 相变窗口做轻量级跳盆；
+V18 接手 dense graph 能力开发。
+```
+
 当前项目聚焦：
 
 ```text
-主问题：random 3-regular MaxCut
-当前规模：n=512 为主验证集，n=1024 为规模检查
+主问题：random regular MaxCut
+V14-UTC 当前规模：n=512 为主验证集，scale test 作上界参考
+V18 当前规模：n=512，degree sweep 到 d=20
 长期目标：构造可解释、可扩展、物理可实验测量的 SQNN-QAOA 组合优化模型
-近期目标：用 Z-basis deterministic direct readout 稳定接近或超过论文口径 GW expected baseline
+近期目标：V14-UTC 完成论文级整理；V18 提升稠密图速度/质量优势
 ```
 
 定位说明：
@@ -39,8 +67,14 @@ classical/
   这里可以调用 quantum/ 里的 SQNN 做对比，但不再定义量子模型类。
 
 scripts/
-  临时探索、批量实验、rescore、报告生成入口。
-  不再把主线量子模型定义在 scripts/ 里。
+  稳定批量实验、rescore、报告生成入口。
+  V14-UTC 当前正式入口见 scripts/README_V14_UTC.md。
+
+maxcut/v14_utc/
+  当前正式 V14-UTC sparse MaxCut 方案、技术路线、测评和报告归档。
+
+maxcut/v18_dissipative/
+  当前 dense graph 开发方向。
 
 历史例外：
   scripts/explore_j_regularized_sqnn.py 仍保留 V12/V13 的
@@ -941,7 +975,7 @@ config.json 或等价配置
 详细记录见：
 
 ```text
-docs/reports/maxcut3_sa_baseline_and_escape.md
+maxcut/v14_utc/reports/archive/maxcut3_sa_baseline_and_escape.md
 ```
 
 当前判断：
@@ -986,7 +1020,7 @@ docs/reports/maxcut3_sa_baseline_and_escape.md
 详细报告见：
 
 ```text
-docs/reports/maxcut512_15min_classical_vs_sqnn_sa.md
+maxcut/v14_utc/reports/archive/maxcut512_15min_classical_vs_sqnn_sa.md
 ```
 
 本轮设置：
@@ -1014,7 +1048,7 @@ SQNN+SA best direct    C/W = 0.897135  (C = 689)
 Detailed report:
 
 ```text
-docs/reports/v14_qtabu_anneal_probe.md
+maxcut/v14_utc/reports/archive/v14_qtabu_anneal_probe.md
 ```
 
 Main script:
@@ -1074,7 +1108,7 @@ promising step is to make trigger/node/strength selection trainable or adaptive.
 Detailed report:
 
 ```text
-docs/reports/v14_soft_global_anneal_probe.md
+maxcut/v14_utc/reports/archive/v14_soft_global_anneal_probe.md
 ```
 
 Main script:
@@ -1223,7 +1257,7 @@ verify that the gain is not a single-graph artifact.
 Detailed report:
 
 ```text
-docs/reports/v14_cluster_bloch_anneal_probe.md
+maxcut/v14_utc/reports/archive/v14_cluster_bloch_anneal_probe.md
 ```
 
 Main script:

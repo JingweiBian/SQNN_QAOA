@@ -1,15 +1,19 @@
 # MaxCut Reports
 
-Historical reports currently live under `docs/reports/` because the remote
-`main` branch already documents them there.
-
-Important report families:
+V14 reports have been consolidated under:
 
 ```text
-docs/reports/maxcut3_*.md
-docs/reports/maxcut512_*.md
-docs/reports/v14_*.md
+maxcut/v14_utc/reports/
 ```
 
-New MaxCut-only reports can be drafted here first.  When a report is meant to
-be part of the repository-wide documentation index, link it from `docs/`.
+Current MaxCut report entry points:
+
+```text
+maxcut/v14_utc/README.md
+maxcut/v14_utc/TECHNICAL_ROUTE.md
+maxcut/v14_utc/EVALUATION.md
+maxcut/v18_dissipative/README.md
+```
+
+This folder is kept as a compatibility/index location. New focused reports
+should go under the relevant task folder first.

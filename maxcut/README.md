@@ -13,9 +13,18 @@ Current layout:
 ```text
 maxcut/
   README.md
-  reports/README.md
-  scripts/README.md
+  v14_utc/
+  v18_dissipative/
+  reports/
+  scripts/
 ```
+
+Current algorithm split:
+
+- `v14_utc/`: frozen formal V14-UTC sparse MaxCut scheme.
+- `v18_dissipative/`: active dense-graph development direction.
+- `reports/`: only a compatibility/index location; V14 reports moved under `v14_utc/reports/`.
+- `scripts/`: MaxCut-local helper scripts; most runnable historical scripts still live in top-level `scripts/`.
 
 Shared model primitives remain in:
 
@@ -32,6 +41,8 @@ frustrated_sync_dynamics/
 Rule of thumb:
 
 - MaxCut-only changes go in `maxcut/`.
+- V14 sparse-graph reporting and formal method details go in `maxcut/v14_utc/`.
+- Dense-graph work should now start from `maxcut/v18_dissipative/`.
 - Frustrated synchronization changes go in `frustrated_sync_dynamics/`.
 - Reusable Bloch/SQNN layers go in `quantum/`.
 - Existing historical MaxCut scripts stay where they are until we migrate them

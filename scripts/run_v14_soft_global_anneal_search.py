@@ -71,6 +71,17 @@ class SoftGlobalConfig:
     metropolis_temperature: float
     clear_aux: str
     clear_fraction: float
+    guard_events: bool
+    guard_accept: str
+    guard_recovery_rounds: int
+    guard_max_expected_drop: float
+    guard_min_direct_gain: int
+    guard_min_dg_gain: int
+    guard_reference: str
+    require_strong_checkpoint: bool
+    strong_checkpoint_min_round: int
+    strong_checkpoint_min_expected: float
+    fast_scan_no_greedy: bool = False
 
 
 def parse_csv(raw: str, cast):
@@ -220,11 +231,18 @@ def apply_soft_global_anneal(
     }
 
 
-def score_bits(engine: IncrementalMaxCut, probabilities: torch.Tensor) -> dict:
+def score_bits(engine: IncrementalMaxCut, probabilities: torch.Tensor, *, use_greedy: bool = True) -> dict:
     bits = (probabilities.detach().cpu().numpy() >= 0.5).astype(np.int8)
     direct_cut = cut_value(engine.edges, bits)
-    _, greedy_cut, _ = engine.greedy_descent(bits)
-    return {"direct_cut": int(direct_cut), "direct_greedy_cut": int(greedy_cut)}
+    if bool(use_greedy):
+        _, greedy_cut, _ = engine.greedy_descent(bits)
+    else:
+        greedy_cut = direct_cut
+    return {
+        "direct_cut": int(direct_cut),
+        "direct_greedy_cut": int(greedy_cut),
+        "greedy_skipped": bool(not use_greedy),
+    }
 
 
 def should_start_event(
@@ -278,8 +296,12 @@ def run_soft_global_v14(model, benchmark, engine: IncrementalMaxCut, config: Sof
     edge_message = torch.empty(0, dtype=model.dtype, device=model.device)
     edge_z_message = torch.empty(0, dtype=model.dtype, device=model.device)
     memory = torch.zeros_like(probabilities)
+    use_internal_greedy = not bool(getattr(config, "fast_scan_no_greedy", False))
 
-    initial_score = score_bits(engine, probabilities)
+    def score_current(current_probabilities: torch.Tensor) -> dict:
+        return score_bits(engine, current_probabilities, use_greedy=use_internal_greedy)
+
+    initial_score = score_current(probabilities)
     best_direct_greedy = int(initial_score["direct_greedy_cut"])
     last_improve_round = 0
     last_event_round = -10**9
@@ -288,11 +310,168 @@ def run_soft_global_v14(model, benchmark, engine: IncrementalMaxCut, config: Sof
     event_count = 0
     used_fixed_starts: set[int] = set()
     events: list[dict] = []
+    pending_checkpoint: dict | None = None
+    strong_checkpoint: dict | None = None
+    strong_checkpoint_key: tuple[float, float, float] | None = None
+
+    def make_state_checkpoint(
+        *,
+        event_index: int,
+        trace_index: int,
+        guard_until: int,
+        score: dict,
+        reference_source: str,
+        reference_round: int,
+    ) -> dict:
+        return {
+            "event_index": int(event_index),
+            "trace_index": int(trace_index),
+            "guard_until": int(guard_until),
+            "reference_source": str(reference_source),
+            "reference_round": int(reference_round),
+            "bloch": bloch.clone(),
+            "probabilities": probabilities.clone(),
+            "current_energy": current_energy.clone(),
+            "phase_memory": phase_memory.clone(),
+            "edge_message": edge_message.clone(),
+            "edge_z_message": edge_z_message.clone(),
+            "memory": memory.clone(),
+            "pre_expected_cut": float((-current_energy).detach().cpu()),
+            "pre_direct_cut": int(score["direct_cut"]),
+            "pre_dg_cut": int(score["direct_greedy_cut"]),
+        }
+
+    def clone_checkpoint_for_event(base: dict, *, event_index: int, guard_until: int) -> dict:
+        return {
+            **base,
+            "event_index": int(event_index),
+            "guard_until": int(guard_until),
+            "bloch": base["bloch"].clone(),
+            "probabilities": base["probabilities"].clone(),
+            "current_energy": base["current_energy"].clone(),
+            "phase_memory": base["phase_memory"].clone(),
+            "edge_message": base["edge_message"].clone(),
+            "edge_z_message": base["edge_z_message"].clone(),
+            "memory": base["memory"].clone(),
+        }
+
+    def checkpoint_key(score: dict, expected_cut: float) -> tuple[float, float, float]:
+        mode = str(config.guard_reference)
+        if mode == "strong_expected":
+            return (float(expected_cut), float(score["direct_greedy_cut"]), float(score["direct_cut"]))
+        if mode == "strong_direct":
+            return (float(score["direct_cut"]), float(score["direct_greedy_cut"]), float(expected_cut))
+        if mode == "strong_dg":
+            return (float(score["direct_greedy_cut"]), float(score["direct_cut"]), float(expected_cut))
+        return (float(score["direct_greedy_cut"]), float(score["direct_cut"]), float(expected_cut))
+
+    def update_strong_checkpoint(round_number: int) -> None:
+        nonlocal strong_checkpoint
+        nonlocal strong_checkpoint_key
+
+        if not str(config.guard_reference).startswith("strong"):
+            return
+        if int(round_number) < int(config.strong_checkpoint_min_round):
+            return
+        score = score_current(probabilities)
+        expected_cut = float((-current_energy).detach().cpu())
+        if expected_cut < float(config.strong_checkpoint_min_expected):
+            return
+        key = checkpoint_key(score, expected_cut)
+        if strong_checkpoint_key is None or key > strong_checkpoint_key:
+            strong_checkpoint_key = key
+            strong_checkpoint = make_state_checkpoint(
+                event_index=-1,
+                trace_index=len(energy_trace) - 1,
+                guard_until=-1,
+                score=score,
+                reference_source=str(config.guard_reference),
+                reference_round=int(round_number),
+            )
+
+    def resolve_pending_guard(round_index: int, *, force: bool = False) -> None:
+        nonlocal bloch
+        nonlocal probabilities
+        nonlocal current_energy
+        nonlocal phase_memory
+        nonlocal edge_message
+        nonlocal edge_z_message
+        nonlocal memory
+        nonlocal best_direct_greedy
+        nonlocal last_improve_round
+        nonlocal pending_checkpoint
+
+        if pending_checkpoint is None:
+            return
+        if int(round_index) < int(pending_checkpoint["guard_until"]) and not bool(force):
+            return
+
+        post_score = score_current(probabilities)
+        post_expected_cut = float((-current_energy).detach().cpu())
+        pre_expected_cut = float(pending_checkpoint["pre_expected_cut"])
+        pre_direct_cut = int(pending_checkpoint["pre_direct_cut"])
+        pre_dg_cut = int(pending_checkpoint["pre_dg_cut"])
+        expected_ok = post_expected_cut >= pre_expected_cut - float(config.guard_max_expected_drop)
+        direct_ok = int(post_score["direct_cut"]) >= pre_direct_cut + int(config.guard_min_direct_gain)
+        dg_ok = int(post_score["direct_greedy_cut"]) >= pre_dg_cut + int(config.guard_min_dg_gain)
+
+        mode = str(config.guard_accept)
+        if mode == "any":
+            accepted_guard = bool(expected_ok or direct_ok or dg_ok)
+        elif mode == "expected":
+            accepted_guard = bool(expected_ok)
+        elif mode == "quality":
+            accepted_guard = bool(expected_ok and (direct_ok or dg_ok or post_expected_cut >= pre_expected_cut))
+        elif mode == "strict":
+            accepted_guard = bool(expected_ok and (direct_ok or dg_ok))
+        else:
+            raise ValueError(f"unknown guard_accept: {mode}")
+
+        event_index = int(pending_checkpoint["event_index"])
+        if 0 <= event_index < len(events):
+            events[event_index].update(
+                {
+                    "guard_checked_round": int(round_index),
+                    "guard_accepted": bool(accepted_guard),
+                    "guard_expected_ok": bool(expected_ok),
+                    "guard_direct_ok": bool(direct_ok),
+                    "guard_dg_ok": bool(dg_ok),
+                    "guard_pre_expected_cut": pre_expected_cut,
+                    "guard_post_expected_cut": post_expected_cut,
+                    "guard_pre_direct_cut": pre_direct_cut,
+                    "guard_post_direct_cut": int(post_score["direct_cut"]),
+                    "guard_pre_direct_greedy_cut": pre_dg_cut,
+                    "guard_post_direct_greedy_cut": int(post_score["direct_greedy_cut"]),
+                    "guard_reference_source": str(pending_checkpoint.get("reference_source", "event")),
+                    "guard_reference_round": int(pending_checkpoint.get("reference_round", -1)),
+                }
+            )
+
+        if not accepted_guard:
+            bloch = pending_checkpoint["bloch"].clone()
+            probabilities = pending_checkpoint["probabilities"].clone()
+            current_energy = pending_checkpoint["current_energy"].clone()
+            phase_memory = pending_checkpoint["phase_memory"].clone()
+            edge_message = pending_checkpoint["edge_message"].clone()
+            edge_z_message = pending_checkpoint["edge_z_message"].clone()
+            memory = pending_checkpoint["memory"].clone()
+            trace_index = int(pending_checkpoint["trace_index"])
+            for item_index in range(trace_index + 1, len(energy_trace)):
+                energy_trace[item_index] = current_energy
+                probability_trace[item_index] = probabilities
+                bloch_trace[item_index] = bloch
+            best_direct_greedy = max(score_current(item)["direct_greedy_cut"] for item in probability_trace)
+            last_improve_round = int(round_index)
+        else:
+            update_strong_checkpoint(round_index)
+
+        pending_checkpoint = None
 
     for round_index in range(model.message_rounds):
+        resolve_pending_guard(round_index)
         if round_index >= active_until:
             active_start = None
-        if active_start is None:
+        if active_start is None and pending_checkpoint is None:
             trigger, reason = should_start_event(
                 round_index=round_index,
                 config=config,
@@ -302,6 +481,24 @@ def run_soft_global_v14(model, benchmark, engine: IncrementalMaxCut, config: Sof
                 used_fixed_starts=used_fixed_starts,
             )
             if trigger:
+                if (
+                    bool(config.guard_events)
+                    and str(config.guard_reference).startswith("strong")
+                    and strong_checkpoint is None
+                    and bool(config.require_strong_checkpoint)
+                ):
+                    last_event_round = int(round_index)
+                    events.append(
+                        {
+                            **asdict(config),
+                            "event_index": -1,
+                            "trigger_round": int(round_index),
+                            "trigger_reason": reason,
+                            "event_skipped": True,
+                            "skip_reason": "no_strong_checkpoint",
+                        }
+                    )
+                    continue
                 active_start = int(round_index)
                 active_until = int(round_index) + max(int(config.window), 1)
                 last_event_round = int(round_index)
@@ -309,6 +506,25 @@ def run_soft_global_v14(model, benchmark, engine: IncrementalMaxCut, config: Sof
                 features = soft_features(engine, probabilities)
                 rho = compute_rho(features, config)
                 clear_mask = make_clear_mask(rho, config.clear_fraction)
+                pre_score = score_current(probabilities)
+                checkpoint = None
+                if bool(config.guard_events):
+                    guard_until = int(active_until) + max(int(config.guard_recovery_rounds), 0)
+                    if str(config.guard_reference).startswith("strong") and strong_checkpoint is not None:
+                        checkpoint = clone_checkpoint_for_event(
+                            strong_checkpoint,
+                            event_index=len(events),
+                            guard_until=guard_until,
+                        )
+                    else:
+                        checkpoint = make_state_checkpoint(
+                            event_index=len(events),
+                            trace_index=len(energy_trace) - 1,
+                            guard_until=guard_until,
+                            score=pre_score,
+                            reference_source="event",
+                            reference_round=int(round_index),
+                        )
                 phase_memory, edge_message, edge_z_message, aux_details = clear_auxiliary_memory(
                     problem,
                     phase_memory,
@@ -325,13 +541,24 @@ def run_soft_global_v14(model, benchmark, engine: IncrementalMaxCut, config: Sof
                         "trigger_round": int(round_index),
                         "trigger_reason": reason,
                         "direct_cut_at_trigger": int(features["direct_cut"]),
+                        "direct_greedy_cut_at_trigger": int(pre_score["direct_greedy_cut"]),
+                        "expected_cut_at_trigger": float((-current_energy).detach().cpu()),
                         "rho_mean_at_trigger": float(rho.mean()),
                         "rho_max_at_trigger": float(rho.max()),
                         "clear_active_count": int(clear_mask.sum()),
+                        "guard_until": int(checkpoint["guard_until"]) if checkpoint is not None else -1,
+                        "guard_reference_source": str(checkpoint.get("reference_source", "none")) if checkpoint is not None else "none",
+                        "guard_reference_round": int(checkpoint.get("reference_round", -1)) if checkpoint is not None else -1,
+                        "guard_reference_expected_cut": float(checkpoint.get("pre_expected_cut", float("nan"))) if checkpoint is not None else float("nan"),
+                        "guard_reference_direct_cut": int(checkpoint.get("pre_direct_cut", -1)) if checkpoint is not None else -1,
+                        "guard_reference_direct_greedy_cut": int(checkpoint.get("pre_dg_cut", -1)) if checkpoint is not None else -1,
+                        "internal_greedy_skipped": bool(not use_internal_greedy),
                     }
                 )
+                pending_checkpoint = checkpoint
 
         progress = None
+        recovery_progress = None
         if active_start is not None and round_index < active_until:
             progress = (round_index - active_start) / float(max(int(config.window) - 1, 1))
             bloch, memory, anneal_details = apply_soft_global_anneal(
@@ -349,6 +576,10 @@ def run_soft_global_v14(model, benchmark, engine: IncrementalMaxCut, config: Sof
                 events[-1].update({f"last_{key}": value for key, value in anneal_details.items()})
         else:
             memory = float(config.memory_decay) * memory
+            if pending_checkpoint is not None and int(round_index) < int(pending_checkpoint["guard_until"]):
+                recovery_start = int(active_until)
+                recovery_span = max(int(pending_checkpoint["guard_until"]) - recovery_start, 1)
+                recovery_progress = (int(round_index) - recovery_start) / float(recovery_span)
 
         old_probabilities = probabilities
         local_field = model._local_field(problem, old_probabilities)
@@ -370,8 +601,9 @@ def run_soft_global_v14(model, benchmark, engine: IncrementalMaxCut, config: Sof
 
         accepted = True
         if model.monotone_accept:
-            if progress is not None and float(config.metropolis_temperature) > 0.0:
-                metro = float(config.metropolis_temperature) * schedule_envelope(progress, config.envelope)
+            non_monotone_progress = progress if progress is not None else recovery_progress
+            if non_monotone_progress is not None and float(config.metropolis_temperature) > 0.0:
+                metro = float(config.metropolis_temperature) * schedule_envelope(non_monotone_progress, config.envelope)
                 accepted = metropolis_accept(
                     current_energy,
                     proposed_energy,
@@ -389,7 +621,7 @@ def run_soft_global_v14(model, benchmark, engine: IncrementalMaxCut, config: Sof
             edge_message = previous_edge_message
             edge_z_message = previous_edge_z_message
 
-        score = score_bits(engine, probabilities)
+        score = score_current(probabilities)
         if int(score["direct_greedy_cut"]) > best_direct_greedy:
             best_direct_greedy = int(score["direct_greedy_cut"])
             last_improve_round = int(round_index + 1)
@@ -402,6 +634,10 @@ def run_soft_global_v14(model, benchmark, engine: IncrementalMaxCut, config: Sof
         energy_trace.append(current_energy)
         probability_trace.append(probabilities)
         bloch_trace.append(bloch)
+        if pending_checkpoint is None:
+            update_strong_checkpoint(round_index + 1)
+
+    resolve_pending_guard(model.message_rounds, force=True)
 
     bloch = model._apply_final_rotation(bloch)
     probabilities = model._probabilities_from_bloch(bloch)
@@ -494,6 +730,16 @@ def random_config(args: argparse.Namespace, rng: np.random.Generator, index: int
         metropolis_temperature=float(rng.choice(parse_csv(args.metropolis_temperatures, float))),
         clear_aux=str(rng.choice(parse_csv(args.clear_aux, str))),
         clear_fraction=float(rng.choice(parse_csv(args.clear_fractions, float))),
+        guard_events=bool(args.guard_events),
+        guard_accept=str(args.guard_accept),
+        guard_recovery_rounds=int(args.guard_recovery_rounds),
+        guard_max_expected_drop=float(args.guard_max_expected_drop),
+        guard_min_direct_gain=int(args.guard_min_direct_gain),
+        guard_min_dg_gain=int(args.guard_min_dg_gain),
+        guard_reference=str(args.guard_reference),
+        require_strong_checkpoint=bool(args.require_strong_checkpoint),
+        strong_checkpoint_min_round=int(args.strong_checkpoint_min_round),
+        strong_checkpoint_min_expected=float(args.strong_checkpoint_min_expected),
     )
 
 
@@ -600,6 +846,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metropolis-temperatures", default="0.0,0.03,0.06,0.10")
     parser.add_argument("--clear-aux", default="none,active")
     parser.add_argument("--clear-fractions", default="0.02,0.05,0.10")
+    parser.add_argument("--guard-events", action="store_true")
+    parser.add_argument("--guard-accept", choices=["any", "expected", "quality", "strict"], default="quality")
+    parser.add_argument("--guard-recovery-rounds", type=int, default=16)
+    parser.add_argument("--guard-max-expected-drop", type=float, default=8.0)
+    parser.add_argument("--guard-min-direct-gain", type=int, default=1)
+    parser.add_argument("--guard-min-dg-gain", type=int, default=1)
+    parser.add_argument(
+        "--guard-reference",
+        choices=["event", "strong_expected", "strong_direct", "strong_dg", "strong_quality"],
+        default="event",
+    )
+    parser.add_argument("--require-strong-checkpoint", action="store_true")
+    parser.add_argument("--strong-checkpoint-min-round", type=int, default=0)
+    parser.add_argument("--strong-checkpoint-min-expected", type=float, default=0.0)
     parser.add_argument("--score-stride", type=int, default=1)
     parser.add_argument("--stop-at", type=int, default=705)
     return parser.parse_args()
@@ -665,12 +925,15 @@ def main() -> None:
                 seed=int(args.seed) + index * 11003,
             )
         trace, summary = score_trace_fast(state, engine, label=case_config.label, stride=int(args.score_stride))
+        skipped_event_count = sum(1 for item in event_records if bool(item.get("event_skipped", False)))
+        actual_event_count = int(len(event_records) - skipped_event_count)
         summary.update(
             {
                 **asdict(case_config),
                 "fixed_starts": ",".join(str(item) for item in case_config.fixed_starts),
                 "case_seconds": float(time.perf_counter() - case_start),
-                "event_count": int(len(event_records)),
+                "event_count": int(actual_event_count),
+                "skipped_event_count": int(skipped_event_count),
             }
         )
         summaries.append(summary)
@@ -682,7 +945,8 @@ def main() -> None:
             f"best_dg={summary['best_direct_greedy_cut']} "
             f"direct={summary['best_direct_cut']} "
             f"expected={summary['best_expected_cut']:.3f} "
-            f"events={len(event_records)} "
+            f"events={actual_event_count} "
+            f"skipped={skipped_event_count} "
             f"case={summary['case_seconds']:.2f}s "
             f"global_best={best_cut}",
             flush=True,

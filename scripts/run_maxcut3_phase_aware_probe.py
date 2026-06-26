@@ -74,6 +74,10 @@ EXTRA_SUMMARY_FIELDS = [
     "z_message_gain",
     "z_message_gain_final",
     "z_message_gain_schedule_start",
+    "density_reference_degree",
+    "dense_field_scale_power",
+    "dense_z_error_scale_power",
+    "dense_signal_scale_max",
     "head_count",
     "head_seed_stride",
     "node_step_mode",
@@ -140,6 +144,10 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         z_message_gain=1.0,
         z_message_gain_final=None,
         z_message_gain_schedule_start=0.60,
+        density_reference_degree=3.0,
+        dense_field_scale_power=0.0,
+        dense_z_error_scale_power=0.0,
+        dense_signal_scale_max=3.0,
         node_step_mode="none",
         rollback_aux_on_reject=False,
     ):
@@ -183,6 +191,14 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
             None if z_message_gain_final is None else float(z_message_gain_final)
         )
         self.z_message_gain_schedule_start = float(z_message_gain_schedule_start)
+        # Dense-graph correction: after degree normalization, random-neighbor
+        # fluctuations shrink roughly like 1/sqrt(d).  These optional powers
+        # re-amplify normalized field/Z-edge residuals relative to the d=3
+        # reference without changing the default V14 behavior.
+        self.density_reference_degree = float(density_reference_degree)
+        self.dense_field_scale_power = float(dense_field_scale_power)
+        self.dense_z_error_scale_power = float(dense_z_error_scale_power)
+        self.dense_signal_scale_max = float(dense_signal_scale_max)
         self.node_step_mode = str(node_step_mode)
         self.rollback_aux_on_reject = bool(rollback_aux_on_reject)
 
@@ -308,6 +324,18 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         norm = torch.linalg.vector_norm(bloch, dim=-1, keepdim=True)
         return bloch / norm.clamp_min(1.0)
 
+    def _dense_degree_scale(self, problem, power):
+        if abs(float(power)) <= 1e-12:
+            return 1.0
+        degree = problem.node_degrees(weighted=True, absolute=True).to(
+            device=self.device,
+            dtype=self.dtype,
+        )
+        reference = max(float(self.density_reference_degree), 1e-6)
+        scale = (degree / reference).clamp_min(1e-6).pow(float(power))
+        max_scale = max(float(self.dense_signal_scale_max), 1e-6)
+        return scale.clamp(max=max_scale)
+
     def _local_field(self, problem, probabilities):
         """计算当前概率下每个变量的 QUBO 局部场 F_i。
 
@@ -334,7 +362,8 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
             device=self.device,
             dtype=self.dtype,
         )
-        return field / normalizer.clamp_min(1e-6)
+        normalized = field / normalizer.clamp_min(1e-6)
+        return normalized * self._dense_degree_scale(problem, self.dense_field_scale_power)
 
     def _neighbor_xy_signal(self, problem, bloch):
         """聚合邻居的 X/Y 相位，得到一个简单的邻居相位力矩。
@@ -566,7 +595,9 @@ class PhaseAwareJRegularizedSQNN(nn.Module):
         node_suggestion = torch.zeros(problem.num_variables, dtype=self.dtype, device=self.device)
         node_suggestion.index_add_(0, head, directed_weight * next_message)
         node_suggestion = (node_suggestion / degree.clamp_min(1e-6)).clamp(-1.0, 1.0)
-        z_error = (node_suggestion - z_value).clamp(-1.0, 1.0)
+        z_error = node_suggestion - z_value
+        z_error = z_error * self._dense_degree_scale(problem, self.dense_z_error_scale_power)
+        z_error = z_error.clamp(-1.0, 1.0)
         return z_error, node_suggestion, next_message
 
     def _node_step_scale(self, local_field, old_probabilities):
@@ -1604,6 +1635,10 @@ def train_phase_one(config, device, output_dir):
             else float(config.get("z_message_gain_final"))
         ),
         z_message_gain_schedule_start=float(config.get("z_message_gain_schedule_start", 0.60)),
+        density_reference_degree=float(config.get("density_reference_degree", 3.0)),
+        dense_field_scale_power=float(config.get("dense_field_scale_power", 0.0)),
+        dense_z_error_scale_power=float(config.get("dense_z_error_scale_power", 0.0)),
+        dense_signal_scale_max=float(config.get("dense_signal_scale_max", 3.0)),
         node_step_mode=config.get("node_step_mode", "none"),
         rollback_aux_on_reject=bool(config.get("rollback_aux_on_reject", False)),
     )

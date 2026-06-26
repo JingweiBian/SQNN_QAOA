@@ -25,6 +25,8 @@ from .heuristics import (
     greedy_round_from_probabilities,
     simulated_annealing,
 )
+from .dissipative_sqnn import QUBODissipativeBlochSQNN
+from .edge_cluster_sqnn import QUBOEdgeClusterDissipativeSQNN
 from .qaoa_init import (
     calibrate_probabilities_with_assignment,
     probabilities_from_qaoa_ry_angles,
@@ -39,6 +41,8 @@ from .preprocess import (
     residual_qaoa_active_summary,
 )
 from .pair_aware_sqnn import QUBOPairAwarePhaseSQNN
+from .path_aware_sqnn import QUBOPathAwarePhaseSQNN
+from .zz_coupled_sqnn import QUBOZZCoupledBlochSQNN
 from .qaoa_limits import (
     max_statevector_qubits,
     qaoa_resource_summary,
@@ -88,17 +92,21 @@ __all__ = [
     "EdgeConditionedRotation",
     "MaxCutBenchmark",
     "PlantedParityQUBOBenchmark",
+    "QUBODissipativeBlochSQNN",
+    "QUBOEdgeClusterDissipativeSQNN",
     "QUBOHybridWarmStartSQNN",
     "QUBOInstanceEmbeddingWarmStartSQNN",
     "QUBOMeanFieldWarmStart",
     "QUBONodeOnlySQNN",
     "QUBOPairAwarePhaseSQNN",
+    "QUBOPathAwarePhaseSQNN",
     "QUBOPositiveXSynchronousLocalFieldSQNN",
     "QUBOProblem",
     "QUBOQuantumDataWarmStartSQNN",
     "QUBOSymmetricWarmStartSQNN",
     "QUBOSynchronousLocalFieldSQNN",
     "QUBOWarmStartSQNN",
+    "QUBOZZCoupledBlochSQNN",
     "QuantumDataBlochInitializer",
     "QuantumDataRotationEncoder",
     "SignedGraphFrustrationBenchmark",

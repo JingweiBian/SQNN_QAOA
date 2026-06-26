@@ -31,12 +31,16 @@ from quantum.warmstart import (
     QUBOInstanceEmbeddingWarmStartSQNN,
     QUBOMeanFieldWarmStart,
     QUBONodeOnlySQNN,
+    QUBODissipativeBlochSQNN,
+    QUBOEdgeClusterDissipativeSQNN,
     QUBOPairAwarePhaseSQNN,
+    QUBOPathAwarePhaseSQNN,
     QUBOPositiveXSynchronousLocalFieldSQNN,
     QUBOQuantumDataWarmStartSQNN,
     QUBOSymmetricWarmStartSQNN,
     QUBOSynchronousLocalFieldSQNN,
     QUBOWarmStartSQNN,
+    QUBOZZCoupledBlochSQNN,
     best_of_random,
     calibrate_probabilities_with_assignment,
     greedy_local_search,
@@ -62,11 +66,15 @@ MODEL_REGISTRY = {
     "mean_field": QUBOMeanFieldWarmStart,
     "node_only": QUBONodeOnlySQNN,
     "pair_aware": QUBOPairAwarePhaseSQNN,
+    "path_aware": QUBOPathAwarePhaseSQNN,
     "quantum_data": QUBOQuantumDataWarmStartSQNN,
     "symmetric": QUBOSymmetricWarmStartSQNN,
     "sync_local": QUBOSynchronousLocalFieldSQNN,
     "sync_local_xpos": QUBOPositiveXSynchronousLocalFieldSQNN,
     "directed": QUBOWarmStartSQNN,
+    "dissipative": QUBODissipativeBlochSQNN,
+    "edge_cluster": QUBOEdgeClusterDissipativeSQNN,
+    "zz_coupled": QUBOZZCoupledBlochSQNN,
 }
 
 
@@ -102,6 +110,54 @@ def build_model(args, problem):
             num_variables=problem.num_variables,
             message_rounds=args.message_rounds,
         )
+    if args.model == "dissipative":
+        return QUBODissipativeBlochSQNN(
+            num_variables=problem.num_variables,
+            message_rounds=args.message_rounds,
+            symmetry_breaking=args.pair_symmetry_breaking,
+            symmetry_strength=args.pair_symmetry_strength,
+            symmetry_strength_trainable=args.pair_symmetry_strength_trainable,
+            symmetry_strength_max=args.pair_symmetry_strength_max,
+            symmetry_seed=args.seed if args.pair_symmetry_seed is None else args.pair_symmetry_seed,
+            normalize_local_field=not args.diss_no_normalize_local_field,
+            dt_init=args.diss_dt_init,
+            transverse_init=args.diss_transverse_init,
+            field_gain_init=args.diss_field_gain_init,
+            precession_init=args.diss_precession_init,
+            damping_init=args.diss_damping_init,
+            transverse_envelope=args.diss_transverse_envelope,
+            monotone_accept=not args.diss_disable_monotone_accept,
+        )
+    if args.model == "edge_cluster":
+        return QUBOEdgeClusterDissipativeSQNN(
+            num_variables=problem.num_variables,
+            message_rounds=args.message_rounds,
+            symmetry_breaking=args.pair_symmetry_breaking,
+            symmetry_strength=args.pair_symmetry_strength,
+            symmetry_strength_trainable=args.pair_symmetry_strength_trainable,
+            symmetry_strength_max=args.pair_symmetry_strength_max,
+            symmetry_seed=args.seed if args.pair_symmetry_seed is None else args.pair_symmetry_seed,
+            normalize_local_field=not args.diss_no_normalize_local_field,
+            dt_init=args.diss_dt_init,
+            transverse_init=args.diss_transverse_init,
+            field_gain_init=args.diss_field_gain_init,
+            precession_init=args.diss_precession_init,
+            damping_init=args.diss_damping_init,
+            transverse_envelope=args.diss_transverse_envelope,
+            monotone_accept=not args.diss_disable_monotone_accept,
+            edge_rzz_init=args.edge_rzz_init,
+            edge_mixer_init=args.edge_mixer_init,
+            edge_cooling_init=args.edge_cooling_init,
+            edge_mix_init=args.edge_mix_init,
+            edge_beta_init=args.edge_beta_init,
+            edge_memory=args.edge_memory,
+            edge_dephase=args.edge_dephase,
+            edge_normalize_coupling=not args.no_edge_normalize_coupling,
+            edge_envelope=args.edge_envelope,
+            edge_phase_first=args.edge_phase_first,
+            coherent_ramp_fraction=args.edge_coherent_ramp_fraction,
+            coherent_ramp_floor=args.edge_coherent_ramp_floor,
+        )
     if args.model == "pair_aware":
         return QUBOPairAwarePhaseSQNN(
             num_variables=problem.num_variables,
@@ -132,6 +188,70 @@ def build_model(args, problem):
             z_message_gain_final=args.pair_z_message_gain_final,
             z_message_gain_schedule_start=args.pair_z_message_gain_schedule_start,
             rollback_aux_on_reject=args.pair_rollback_aux_on_reject,
+        )
+    if args.model == "path_aware":
+        return QUBOPathAwarePhaseSQNN(
+            num_variables=problem.num_variables,
+            message_rounds=args.message_rounds,
+            symmetry_breaking=args.pair_symmetry_breaking,
+            symmetry_strength=args.pair_symmetry_strength,
+            symmetry_strength_trainable=args.pair_symmetry_strength_trainable,
+            symmetry_strength_max=args.pair_symmetry_strength_max,
+            symmetry_seed=args.seed if args.pair_symmetry_seed is None else args.pair_symmetry_seed,
+            trust_mode=args.pair_trust_mode,
+            trust_shrink=args.pair_trust_shrink,
+            trust_threshold=args.pair_trust_threshold,
+            phase_mode=args.pair_phase_mode,
+            phase_memory_decay=args.pair_phase_memory_decay,
+            two_stage_fraction=args.pair_two_stage_fraction,
+            collapse_init=args.pair_collapse_init,
+            final_rotation_max=args.pair_final_rotation_max,
+            z_message_gain=args.pair_z_message_gain,
+            z_message_gain_final=args.pair_z_message_gain_final,
+            z_message_gain_schedule_start=args.pair_z_message_gain_schedule_start,
+            rollback_aux_on_reject=args.pair_rollback_aux_on_reject,
+            path_depth=args.path_depth,
+            path_mix=args.path_mix,
+            path_gain=args.path_gain,
+            path_confidence_power=args.path_confidence_power,
+            path_gate_mode=args.path_gate_mode,
+            path_gate_threshold=args.path_gate_threshold,
+            path_gate_temperature=args.path_gate_temperature,
+            monotone_accept=not args.path_disable_monotone_accept,
+        )
+    if args.model == "zz_coupled":
+        return QUBOZZCoupledBlochSQNN(
+            num_variables=problem.num_variables,
+            message_rounds=args.message_rounds,
+            symmetry_breaking=args.pair_symmetry_breaking,
+            symmetry_strength=args.pair_symmetry_strength,
+            symmetry_strength_trainable=args.pair_symmetry_strength_trainable,
+            symmetry_strength_max=args.pair_symmetry_strength_max,
+            symmetry_seed=args.seed if args.pair_symmetry_seed is None else args.pair_symmetry_seed,
+            trust_mode=args.pair_trust_mode,
+            trust_shrink=args.pair_trust_shrink,
+            trust_threshold=args.pair_trust_threshold,
+            phase_mode=args.pair_phase_mode,
+            phase_memory_decay=args.pair_phase_memory_decay,
+            two_stage_fraction=args.pair_two_stage_fraction,
+            collapse_init=args.pair_collapse_init,
+            final_rotation_max=args.pair_final_rotation_max,
+            z_message_gain=args.pair_z_message_gain,
+            z_message_gain_final=args.pair_z_message_gain_final,
+            z_message_gain_schedule_start=args.pair_z_message_gain_schedule_start,
+            rollback_aux_on_reject=args.pair_rollback_aux_on_reject,
+            zz_phase_init=args.zz_phase_init,
+            zz_phase_envelope=args.zz_phase_envelope,
+            zz_node_update_scale=args.zz_node_update_scale,
+            zz_moment_decay=args.zz_moment_decay,
+            zz_normalize_coupling=not args.no_zz_normalize_coupling,
+            zz_node_aggregate=args.zz_node_aggregate,
+            zz_coupling_mode=args.zz_coupling_mode,
+            zz_rz_signal_scale=args.zz_rz_signal_scale,
+            zz_field_signal_scale=args.zz_field_signal_scale,
+            zz_signal_normalize=args.zz_signal_normalize,
+            zz_signal_clip=args.zz_signal_clip,
+            monotone_accept=not args.zz_disable_monotone_accept,
         )
     model_cls = MODEL_REGISTRY[args.model]
     return model_cls(
@@ -696,6 +816,58 @@ def main():
     parser.add_argument("--pair-z-message-gain-final", type=float, default=2.6)
     parser.add_argument("--pair-z-message-gain-schedule-start", type=float, default=0.55)
     parser.add_argument("--pair-rollback-aux-on-reject", action="store_true")
+    parser.add_argument("--diss-dt-init", type=float, default=0.20)
+    parser.add_argument("--diss-transverse-init", type=float, default=0.50)
+    parser.add_argument("--diss-field-gain-init", type=float, default=1.00)
+    parser.add_argument("--diss-precession-init", type=float, default=0.20)
+    parser.add_argument("--diss-damping-init", type=float, default=0.60)
+    parser.add_argument(
+        "--diss-transverse-envelope",
+        choices=["constant", "linear_cool", "cosine_cool", "linear_warm"],
+        default="linear_cool",
+    )
+    parser.add_argument("--diss-disable-monotone-accept", action="store_true")
+    parser.add_argument("--diss-no-normalize-local-field", action="store_true")
+    parser.add_argument("--edge-rzz-init", type=float, default=0.05)
+    parser.add_argument("--edge-mixer-init", type=float, default=0.0)
+    parser.add_argument("--edge-cooling-init", type=float, default=0.0)
+    parser.add_argument("--edge-mix-init", type=float, default=0.10)
+    parser.add_argument("--edge-beta-init", type=float, default=2.0)
+    parser.add_argument("--edge-memory", type=float, default=0.0)
+    parser.add_argument("--edge-dephase", type=float, default=0.50)
+    parser.add_argument("--no-edge-normalize-coupling", action="store_true")
+    parser.add_argument("--edge-phase-first", action="store_true")
+    parser.add_argument("--edge-coherent-ramp-fraction", type=float, default=0.0)
+    parser.add_argument("--edge-coherent-ramp-floor", type=float, default=1.0)
+    parser.add_argument(
+        "--edge-envelope",
+        choices=["constant", "linear_cool", "cosine_cool", "linear_warm"],
+        default="linear_cool",
+    )
+    parser.add_argument("--path-depth", type=int, default=2)
+    parser.add_argument("--path-mix", type=float, default=0.25)
+    parser.add_argument("--path-gain", type=float, default=1.0)
+    parser.add_argument("--path-confidence-power", type=float, default=1.0)
+    parser.add_argument("--path-gate-mode", choices=["fixed", "confidence", "conflict", "hybrid"], default="fixed")
+    parser.add_argument("--path-gate-threshold", type=float, default=0.60)
+    parser.add_argument("--path-gate-temperature", type=float, default=0.10)
+    parser.add_argument("--path-disable-monotone-accept", action="store_true")
+    parser.add_argument("--zz-phase-init", type=float, default=0.10)
+    parser.add_argument(
+        "--zz-phase-envelope",
+        choices=["constant", "linear_cool", "cosine_cool", "linear_warm"],
+        default="constant",
+    )
+    parser.add_argument("--zz-node-update-scale", type=float, default=1.0)
+    parser.add_argument("--zz-moment-decay", type=float, default=0.90)
+    parser.add_argument("--no-zz-normalize-coupling", action="store_true")
+    parser.add_argument("--zz-node-aggregate", choices=["mean", "sum", "product"], default="product")
+    parser.add_argument("--zz-coupling-mode", choices=["state", "rz", "field", "rz_field"], default="state")
+    parser.add_argument("--zz-rz-signal-scale", type=float, default=1.0)
+    parser.add_argument("--zz-field-signal-scale", type=float, default=-1.0)
+    parser.add_argument("--zz-signal-normalize", action="store_true")
+    parser.add_argument("--zz-signal-clip", type=float, default=0.0)
+    parser.add_argument("--zz-disable-monotone-accept", action="store_true")
     parser.add_argument("--disable-pair-guided-readout", action="store_true")
     parser.add_argument("--pair-guided-readout-samples", type=int, default=None)
     parser.add_argument("--pair-guided-base-logit-weight", type=float, default=1.0)
@@ -769,7 +941,7 @@ def main():
     )
 
     pair_readout_state = None
-    if args.model == "pair_aware" and not args.disable_pair_guided_readout:
+    if args.model in {"pair_aware", "zz_coupled"} and not args.disable_pair_guided_readout:
         with torch.no_grad():
             pair_readout_state = model(benchmark.problem, return_state=True)
             probabilities = pair_readout_state["probabilities"]
@@ -782,20 +954,22 @@ def main():
         best_known=best_known,
     )
     if pair_readout_state is not None:
-        if hasattr(model, "pair_expected_energy"):
+        pair_expected_energy = None
+        if hasattr(model, "pair_expected_energy") and "raw_corr" in pair_readout_state:
             pair_expected_energy = model.pair_expected_energy(
                 benchmark.problem,
                 probabilities,
                 pair_readout_state["raw_corr"],
                 include_regularization=False,
             )
-        else:
+        elif "pair_expected_energy" in pair_readout_state:
             pair_expected_energy = pair_readout_state["pair_expected_energy"]
         loss_energy = pair_readout_state.get("loss_energy")
         corr = pair_readout_state.get("corr")
-        sqnn_eval["pair_expected_energy"] = float(pair_expected_energy.detach().cpu())
-        sqnn_eval["pair_expected_objective"] = float((-pair_expected_energy).detach().cpu())
-        sqnn_eval["pair_expected_ratio"] = expected_ratio_from_energy(pair_expected_energy, best_known)
+        if pair_expected_energy is not None:
+            sqnn_eval["pair_expected_energy"] = float(pair_expected_energy.detach().cpu())
+            sqnn_eval["pair_expected_objective"] = float((-pair_expected_energy).detach().cpu())
+            sqnn_eval["pair_expected_ratio"] = expected_ratio_from_energy(pair_expected_energy, best_known)
         if loss_energy is not None:
             sqnn_eval["training_loss_energy"] = float(loss_energy.detach().cpu())
         if corr is not None:
@@ -806,6 +980,20 @@ def main():
             sqnn_eval["corr_consistency_energy"] = float(
                 pair_readout_state["corr_consistency_trace"][-1].detach().cpu()
             )
+        if "edge_zz_trace" in pair_readout_state and pair_readout_state["edge_zz_trace"].numel():
+            final_edge_zz = pair_readout_state["edge_zz_trace"][-1]
+            sqnn_eval["edge_zz_mean"] = float(final_edge_zz.mean().detach().cpu())
+            sqnn_eval["edge_zz_abs_mean"] = float(final_edge_zz.abs().mean().detach().cpu())
+            sqnn_eval["edge_zz_std"] = float(final_edge_zz.std(unbiased=False).detach().cpu())
+        if "zz_phase_steps" in pair_readout_state:
+            zz_phase_steps = pair_readout_state["zz_phase_steps"]
+            sqnn_eval["zz_phase_mean"] = float(zz_phase_steps.mean().detach().cpu())
+            sqnn_eval["zz_phase_std"] = float(zz_phase_steps.std(unbiased=False).detach().cpu())
+        if "zz_signal_trace" in pair_readout_state and pair_readout_state["zz_signal_trace"].numel():
+            final_zz_signal = pair_readout_state["zz_signal_trace"][-1]
+            sqnn_eval["zz_signal_mean"] = float(final_zz_signal.mean().detach().cpu())
+            sqnn_eval["zz_signal_abs_mean"] = float(final_zz_signal.abs().mean().detach().cpu())
+            sqnn_eval["zz_signal_std"] = float(final_zz_signal.std(unbiased=False).detach().cpu())
     pair_guided_eval = None
     if pair_readout_state is not None:
         pair_readout_samples = (
